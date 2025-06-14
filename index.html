@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>项目导航 - 数字创作空间</title>
+    <style>
+        :root {
+            --primary: #2A2A2A;
+            --accent: #FF6B6B;
+            --text: #F4F4F4;
+        }
+
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            background: linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 100%);
+            color: var(--text);
+            margin: 0;
+            padding: 2rem;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            text-align: center;
+            font-size: 2.5rem;
+            margin-bottom: 3rem;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+            padding: 1rem;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 15px;
+            padding: 1.5rem;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 20px rgba(0,0,0,0.2);
+            background: rgba(255, 255, 255, 0.15);
+        }
+
+        .card a {
+            text-decoration: none;
+            color: inherit;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .card h2 {
+            margin: 1rem 0;
+            color: var(--accent);
+            font-size: 1.5rem;
+        }
+
+        .card p {
+            text-align: center;
+            opacity: 0.9;
+            line-height: 1.6;
+        }
+
+        @media (max-width: 768px) {
+            .grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎨 数字创作空间</h1>
+        <div class="grid">
+            <div class="card">
+                <a href="Keyboard_piano.html">
+                    <h2>🎹 键盘钢琴</h2>
+                    <p>交互式网页钢琴，支持键盘和鼠标操作</p>
+                </a>
+            </div>
+            <div class="card">
+                <a href="StarRail.html">
+                    <h2>🚀 星穹铁道</h2>
+                    <p>太空主题的视觉特效展示页面</p>
+                </a>
+            </div>
+            <!--<div class="card">
+                <a href="city_scene.html">
+                    <h2>🌆 城市夜景</h2>
+                    <p>动态3D城市景观可视化</p>
+                </a>
+            </div>-->
+            <div class="card">
+                <a href="digital_piano.html">
+                    <h2>🎼 小键盘钢琴</h2>
+                    <p>交互式网页钢琴，支持键盘和鼠标操作</p>
+                </a>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

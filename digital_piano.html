@@ -1,0 +1,857 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>小键盘钢琴</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a2a6c, #b21f1f, #fdbb2d);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+            color: #fff;
+            overflow-x: hidden;
+        }
+        
+        .container {
+            max-width: 1200px;
+            width: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+            margin-top: 20px;
+            position: relative;
+        }
+        
+        header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        
+        h1 {
+            font-size: 2.8rem;
+            margin-bottom: 10px;
+            color: #ffd700;
+            text-shadow: 0 0 10px rgba(255, 215, 0, 0.5);
+        }
+        
+        .subtitle {
+            font-size: 1.2rem;
+            color: #ccc;
+            max-width: 600px;
+            margin: 0 auto;
+            line-height: 1.6;
+        }
+        
+        .status-container {
+            text-align: center;
+            margin: 30px 20px;
+            padding: 20px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 15px;
+            backdrop-filter: blur(10px);
+        }
+        
+        .status {
+            font-size: 1.8rem;
+            margin-bottom: 20px;
+            color: #fff;
+        }
+        
+        .status span {
+            color: #ffd700;
+            font-weight: bold;
+        }
+        
+        .visual-key {
+            width: 100px;
+            height: 100px;
+            background: rgba(255, 255, 255, 0.15);
+            border-radius: 50%;
+            margin: 0 auto 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 3rem;
+            transition: all 0.2s;
+            color: #ffd700;
+            border: 3px solid rgba(255, 215, 0, 0.3);
+        }
+        
+        .visual-key.active {
+            transform: scale(1.1);
+            background: rgba(255, 215, 0, 0.2);
+            box-shadow: 0 0 20px rgba(255, 215, 0, 0.5);
+        }
+        
+        .hint {
+            color: #aaa;
+            font-size: 1.1rem;
+            margin-top: 10px;
+        }
+        
+        .piano-container {
+            display: flex;
+            justify-content: space-between;
+            margin: 40px 0;
+            flex-wrap: wrap;
+            gap: 40px;
+        }
+        
+        .piano-section {
+            flex: 1;
+            min-width: 300px;
+        }
+        
+        .section-title {
+            font-size: 1.5rem;
+            margin-bottom: 20px;
+            color: #ffd700;
+            text-align: center;
+        }
+        
+        .piano {
+            display: flex;
+            justify-content: center;
+            padding: 20px;
+            background: rgba(0, 0, 0, 0.4);
+            border-radius: 15px;
+            flex-wrap: wrap;
+            overflow-x: auto;
+            padding-bottom: 10px;
+        }
+        
+        .key {
+            width: 50px;
+            height: 200px;
+            border: 1px solid #444;
+            margin: 0 2px;
+            transition: all 0.1s;
+            display: flex;
+            align-items: flex-end;
+            justify-content: center;
+            font-family: Arial;
+            background: linear-gradient(to bottom, #fff, #f0f0f0);
+            border-radius: 0 0 8px 8px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+            position: relative;
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+        
+        .key::after {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 0;
+            background: rgba(255, 215, 0, 0.6);
+            transition: height 0.1s;
+        }
+        
+        .key.active {
+            box-shadow: 0 0 15px rgba(255, 215, 0, 0.7);
+        }
+        
+        .key.active::after {
+            height: 100%;
+        }
+        
+        .num-display {
+            margin-bottom: 15px;
+            color: #333;
+            font-weight: bold;
+            font-size: 1.1rem;
+            z-index: 1;
+        }
+        
+        .keyboard-layout {
+            flex: 1;
+            min-width: 300px;
+        }
+        
+        .numpad-layout {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            max-width: 330px;
+            margin: 0 auto;
+            background: rgba(0, 0, 0, 0.4);
+            padding: 20px;
+            border-radius: 15px;
+        }
+        
+        .numpad-row {
+            display: flex;
+            justify-content: left;
+            gap: 10px;
+        }
+        
+        .numpad-key {
+            width: 60px;
+            height: 60px;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid #444;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 1.3rem;
+            color: #fff;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            transition: all 0.1s;
+            cursor: pointer;
+            user-select: none;
+        }
+        
+        .numpad-key:hover {
+            background: rgba(255, 255, 255, 0.15);
+        }
+        
+        .numpad-key.active {
+            background: rgba(255, 215, 0, 0.3);
+            box-shadow: 0 0 15px rgba(255, 215, 0, 0.5);
+            transform: scale(0.95);
+        }
+        
+        .numpad-plus {
+            height: 130px;
+        }
+        
+        .numpad-enter {
+            height: 130px;
+        }
+        
+        .numpad-zero {
+            width: 130px;
+        }
+        
+        .footer {
+            margin-top: 30px;
+            text-align: center;
+            color: #aaa;
+            font-size: 0.9rem;
+        }
+        
+        .note {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 20px;
+            font-size: 0.95rem;
+        }
+
+        .numpad-row-456 {
+            margin-top: -70px;
+        }
+
+        .numpad-row-0 {
+            margin-top: -70px;
+        }
+        
+        .piano-info {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 15px;
+            padding: 10px;
+            background: rgba(255, 215, 0, 0.1);
+            border-radius: 8px;
+        }
+        
+        .sound-type {
+            font-size: 1.1rem;
+            color: #ffd700;
+        }
+        
+        .sound-controls {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .sound-btn {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 215, 0, 0.3);
+            color: #ffd700;
+            padding: 6px 12px;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .sound-btn.active {
+            background: rgba(255, 215, 0, 0.3);
+            box-shadow: 0 0 8px rgba(255, 215, 0, 0.5);
+        }
+        
+        @media (max-width: 768px) {
+            .piano-container {
+                flex-direction: column;
+            }
+            
+            .piano-section, .keyboard-layout {
+                width: 100%;
+            }
+            
+            .key {
+                width: 35px;
+                height: 160px;
+            }
+            
+            .numpad-layout {
+                max-width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>🎹 小键盘钢琴</h1>
+        <p class="subtitle">使用数字小键盘演奏音乐</p>
+    </header>
+    
+    <div class="container">
+        <div class="status-container">
+            <div class="status">当前按下：<span id="currentKey">-</span></div>
+            <div class="visual-key" id="visualKeyDisplay"></div>
+            <div class="hint">使用小键盘按键演奏音符，所有按键都有对应音阶</div>
+        </div>
+        
+        <div class="piano-container">
+            <div class="piano-section">
+                <div class="section-title">钢琴键盘</div>
+                <div class="piano">
+                    <!-- 按键顺序调整为：0 . Enter 1 2 3 ... -->
+                    <div class="key" data-note="0">
+                        <div class="num-display">0</div>
+                    </div>
+                    <div class="key" data-note=".">
+                        <div class="num-display">.</div>
+                    </div>
+                    <div class="key" data-note="Enter">
+                        <div class="num-display">Ent</div>
+                    </div>
+                    
+                    <div class="key" data-note="1">
+                        <div class="num-display">1</div>
+                    </div>
+                    <div class="key" data-note="2">
+                        <div class="num-display">2</div>
+                    </div>
+                    <div class="key" data-note="3">
+                        <div class="num-display">3</div>
+                    </div>
+                    <div class="key" data-note="4">
+                        <div class="num-display">4</div>
+                    </div>
+                    <div class="key" data-note="5">
+                        <div class="num-display">5</div>
+                    </div>
+                    <div class="key" data-note="6">
+                        <div class="num-display">6</div>
+                    </div>
+                    <div class="key" data-note="7">
+                        <div class="num-display">7</div>
+                    </div>
+                    <div class="key" data-note="8">
+                        <div class="num-display">8</div>
+                    </div>
+                    <div class="key" data-note="9">
+                        <div class="num-display">9</div>
+                    </div>
+                    
+                    <div class="key" data-note="+">
+                        <div class="num-display">+</div>
+                    </div>
+                    <div class="key" data-note="/">
+                        <div class="num-display">/</div>
+                    </div>
+                    <div class="key" data-note="*">
+                        <div class="num-display">*</div>
+                    </div>
+                    <div class="key" data-note="-">
+                        <div class="num-display">-</div>
+                    </div>
+                </div>
+                
+                <div class="piano-info">
+                    <div class="sound-type">当前音色: <span id="soundType">钢琴</span></div>
+                    <div class="sound-controls">
+                        <div class="sound-btn active" data-type="piano">钢琴</div>
+                        <div class="sound-btn" data-type="sine">正弦波</div>
+                        <div class="sound-btn" data-type="organ">风琴</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="keyboard-layout">
+                <div class="section-title">小键盘布局</div>
+                <div class="numpad-layout">
+                    <div class="numpad-row">
+                        <div class="numpad-key" data-key="NumLock">Num</div>
+                        <div class="numpad-key" data-key="/">/</div>
+                        <div class="numpad-key" data-key="*">*</div>
+                        <div class="numpad-key" data-key="-">-</div>
+                    </div>
+                    <div class="numpad-row">
+                        <div class="numpad-key number" data-key="7">7</div>
+                        <div class="numpad-key number" data-key="8">8</div>
+                        <div class="numpad-key number" data-key="9">9</div>
+                        <div class="numpad-key numpad-plus" data-key="+">+</div>
+                    </div>
+                    <div class="numpad-row numpad-row-456">
+                        <div class="numpad-key number" data-key="4">4</div>
+                        <div class="numpad-key number" data-key="5">5</div>
+                        <div class="numpad-key number" data-key="6">6</div>
+                    </div>
+                    <div class="numpad-row">
+                        <div class="numpad-key number" data-key="1">1</div>
+                        <div class="numpad-key number" data-key="2">2</div>
+                        <div class="numpad-key number" data-key="3">3</div>
+                        <div class="numpad-key numpad-enter" data-key="Enter">Enter</div>
+                    </div>
+                    <div class="numpad-row numpad-row-0">
+                        <div class="numpad-key numpad-zero" data-key="0">0</div>
+                        <div class="numpad-key" data-key=".">.</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="note">
+            <p><strong>使用说明：</strong> 请确保您的键盘有数字小键盘区域。按下小键盘上的按键可以演奏不同音高的音符，同时钢琴键盘和小键盘上的对应按键会高亮显示。</p>
+            <p><strong>音阶顺序：</strong> 0 . Enter 1 2 3 4 5 6 7 8 9 + / * - (从低到高)</p>
+            <p><strong>音阶间隔：</strong> 符合自然音阶规律（C大调）</p>
+            <p><strong>音色选择：</strong> 您可以在钢琴键盘上方选择不同的音色（钢琴、正弦波、风琴）</p>
+            <p><strong>音符对应：</strong> 
+                <br>0: A3 (220.00Hz) | .: B3 (246.94Hz) | Enter: C4 (261.63Hz)
+                <br>1: D4 (293.66Hz) | 2: E4 (329.63Hz) | 3: F4 (349.23Hz)
+                <br>4: G4 (392.00Hz) | 5: A4 (440.00Hz) | 6: B4 (493.88Hz)
+                <br>7: C5 (523.25Hz) | 8: D5 (587.33Hz) | 9: E5 (659.26Hz)
+                <br>+: F5 (698.46Hz) | /: G5 (783.99Hz) | *: A5 (880.00Hz) | -: B5 (987.77Hz)
+            </p>
+            <p><strong>按键行为：</strong> 长按按键只会播放一次声音，短按会播放完整音符</p>
+        </div>
+    </div>
+    
+    <div class="footer">
+        <p>小键盘钢琴 &copy; 2025 | 使用Web Audio API实现</p>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            let audioContext;
+            try {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            } catch (e) {
+                alert('您的浏览器不支持Web Audio API，无法使用钢琴功能');
+                return;
+            }
+            
+            // 修正后的频率映射（符合自然音阶）
+            const frequencies = {
+                '0': 220.00,    // A3
+                '.': 246.94,    // B3
+                'Enter': 261.63,// C4
+                '1': 293.66,    // D4
+                '2': 329.63,    // E4
+                '3': 349.23,    // F4
+                '4': 392.00,    // G4
+                '5': 440.00,    // A4
+                '6': 493.88,    // B4
+                '7': 523.25,    // C5
+                '8': 587.33,    // D5
+                '9': 659.26,    // E5
+                '+': 698.46,    // F5
+                '/': 783.99,    // G5
+                '*': 880.00,    // A5
+                '-': 987.77     // B5
+            };
+            
+            // 获取所有按键元素
+            const pianoKeys = document.querySelectorAll('.key');
+            const numpadKeys = document.querySelectorAll('.numpad-key');
+            
+            // 当前音色类型
+            let currentSoundType = 'piano';
+            
+            // 存储当前活动的振荡器和增益节点
+            const activeOscillators = {};
+            
+            // 更接近钢琴的音色实现
+            function playPianoTone(freq, key) {
+                const now = audioContext.currentTime;
+                const duration = 1.5;
+                
+                // 创建主振荡器（锯齿波，提供丰富的泛音）
+                const mainOsc = audioContext.createOscillator();
+                mainOsc.type = 'sawtooth';
+                mainOsc.frequency.value = freq;
+                
+                // 创建辅助振荡器（正弦波，增强基音）
+                const subOsc = audioContext.createOscillator();
+                subOsc.type = 'sine';
+                subOsc.frequency.value = freq;
+                
+                // 创建低频振荡器（颤音效果）
+                const lfo = audioContext.createOscillator();
+                lfo.type = 'sine';
+                lfo.frequency.value = 5; // 缓慢颤音
+                
+                // 创建增益控制器（颤音效果）
+                const lfoGain = audioContext.createGain();
+                lfoGain.gain.value = 0.8; // 颤音强度
+                
+                // 创建滤波器（塑造音色）
+                const filter = audioContext.createBiquadFilter();
+                filter.type = 'lowpass';
+                filter.frequency.value = 2000;
+                filter.Q.value = 1;
+                
+                // 创建主增益节点（音量包络）
+                const mainGain = audioContext.createGain();
+                mainGain.gain.setValueAtTime(0, now);
+                mainGain.gain.linearRampToValueAtTime(0.3, now + 0.02); // 快速起音
+                mainGain.gain.exponentialRampToValueAtTime(0.15, now + 0.1); // 衰减
+                mainGain.gain.exponentialRampToValueAtTime(0.01, now + duration); // 释放
+                
+                // 创建辅助增益节点
+                const subGain = audioContext.createGain();
+                subGain.gain.value = 0.2;
+                
+                // 连接节点
+                lfo.connect(lfoGain);
+                lfoGain.connect(mainOsc.detune);
+                
+                mainOsc.connect(filter);
+                subOsc.connect(subGain);
+                subGain.connect(filter);
+                filter.connect(mainGain);
+                mainGain.connect(audioContext.destination);
+                
+                // 启动振荡器
+                mainOsc.start(now);
+                subOsc.start(now);
+                lfo.start(now);
+                
+                // 停止振荡器
+                mainOsc.stop(now + duration);
+                subOsc.stop(now + duration);
+                lfo.stop(now + duration);
+                
+                // 存储振荡器以便释放
+                activeOscillators[key] = {
+                    oscillators: [mainOsc, subOsc, lfo],
+                    gain: mainGain
+                };
+            }
+            
+            // 正弦波音色
+            function playSineTone(freq, key) {
+                const oscillator = audioContext.createOscillator();
+                const gainNode = audioContext.createGain();
+                
+                oscillator.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+                
+                oscillator.type = 'sine';
+                oscillator.frequency.value = freq;
+                gainNode.gain.value = 0.1;
+                
+                oscillator.start();
+                
+                // 存储振荡器以便释放
+                activeOscillators[key] = {
+                    oscillators: [oscillator],
+                    gain: gainNode
+                };
+            }
+            
+            // 风琴音色
+            function playOrganTone(freq, key) {
+                const now = audioContext.currentTime;
+                
+                // 创建三个振荡器（风琴音色）
+                const osc1 = audioContext.createOscillator();
+                const osc2 = audioContext.createOscillator();
+                const osc3 = audioContext.createOscillator();
+                
+                osc1.type = 'sine';
+                osc2.type = 'sine';
+                osc3.type = 'sine';
+                
+                // 风琴音色使用多个谐波
+                osc1.frequency.value = freq;
+                osc2.frequency.value = freq * 2;
+                osc3.frequency.value = freq * 3;
+                
+                // 创建增益节点
+                const gain1 = audioContext.createGain();
+                const gain2 = audioContext.createGain();
+                const gain3 = audioContext.createGain();
+                
+                gain1.gain.value = 0.3;
+                gain2.gain.value = 0.2;
+                gain3.gain.value = 0.15;
+                
+                // 主增益节点
+                const mainGain = audioContext.createGain();
+                mainGain.gain.value = 0.4;
+                
+                // 连接节点
+                osc1.connect(gain1);
+                osc2.connect(gain2);
+                osc3.connect(gain3);
+                
+                gain1.connect(mainGain);
+                gain2.connect(mainGain);
+                gain3.connect(mainGain);
+                
+                mainGain.connect(audioContext.destination);
+                
+                // 启动振荡器
+                osc1.start(now);
+                osc2.start(now);
+                osc3.start(now);
+                
+                // 存储振荡器以便释放
+                activeOscillators[key] = {
+                    oscillators: [osc1, osc2, osc3],
+                    gain: mainGain
+                };
+            }
+            
+            // 停止特定键的音符
+            function stopTone(key) {
+                if (activeOscillators[key]) {
+                    // 停止所有振荡器
+                    activeOscillators[key].oscillators.forEach(osc => {
+                        try {
+                            osc.stop();
+                        } catch(e) {
+                            console.warn("Error stopping oscillator:", e);
+                        }
+                    });
+                    
+                    // 快速淡出增益（避免爆音）
+                    const now = audioContext.currentTime;
+                    activeOscillators[key].gain.gain.setValueAtTime(
+                        activeOscillators[key].gain.gain.value, 
+                        now
+                    );
+                    activeOscillators[key].gain.gain.exponentialRampToValueAtTime(
+                        0.001, 
+                        now + 0.1
+                    );
+                    
+                    // 从活动振荡器中移除
+                    delete activeOscillators[key];
+                }
+            }
+            
+            // 根据当前音色类型播放音调
+            function playTone(freq, key) {
+                if (!audioContext) return;
+                
+                // 如果已经有相同键的音符在播放，先停止它
+                if (activeOscillators[key]) {
+                    stopTone(key);
+                }
+                
+                switch(currentSoundType) {
+                    case 'piano':
+                        playPianoTone(freq, key);
+                        break;
+                    case 'sine':
+                        playSineTone(freq, key);
+                        break;
+                    case 'organ':
+                        playOrganTone(freq, key);
+                        break;
+                    default:
+                        playPianoTone(freq, key);
+                }
+            }
+            
+            // 高亮按键
+            function highlightKey(key) {
+                // 高亮钢琴键
+                pianoKeys.forEach(pianoKey => {
+                    if (pianoKey.dataset.note === key) {
+                        pianoKey.classList.add('active');
+                    }
+                });
+                
+                // 高亮小键盘键
+                numpadKeys.forEach(numpadKey => {
+                    if (numpadKey.dataset.key === key) {
+                        numpadKey.classList.add('active');
+                    }
+                });
+            }
+            
+            // 移除高亮并停止声音
+            function releaseKey(key) {
+                // 移除钢琴键高亮
+                pianoKeys.forEach(pianoKey => {
+                    if (pianoKey.dataset.note === key) {
+                        pianoKey.classList.remove('active');
+                    }
+                });
+                
+                // 移除小键盘键高亮
+                numpadKeys.forEach(numpadKey => {
+                    if (numpadKey.dataset.key === key) {
+                        numpadKey.classList.remove('active');
+                    }
+                });
+                
+                // 停止声音（如果是持续音色）
+                if (currentSoundType === 'sine' || currentSoundType === 'organ') {
+                    stopTone(key);
+                }
+            }
+            
+            // 处理按键按下
+            function handleKeyDown(key) {
+                // 如果事件是重复触发（长按），则忽略
+                if (document.querySelector(`.key[data-note="${key}"].active`)) {
+                    return;
+                }
+                
+                // 更新状态显示
+                document.getElementById('currentKey').textContent = key;
+                document.getElementById('visualKeyDisplay').textContent = key;
+                document.getElementById('visualKeyDisplay').classList.add('active');
+                
+                // 高亮按键
+                highlightKey(key);
+                
+                // 播放声音
+                if (frequencies[key]) {
+                    playTone(frequencies[key], key);
+                }
+            }
+            
+            // 处理按键释放
+            function handleKeyUp(key) {
+                // 释放按键
+                releaseKey(key);
+                
+                // 重置状态显示
+                if (document.querySelectorAll('.key.active, .numpad-key.active').length === 0) {
+                    document.getElementById('currentKey').textContent = '-';
+                    document.getElementById('visualKeyDisplay').textContent = '';
+                    document.getElementById('visualKeyDisplay').classList.remove('active');
+                }
+            }
+            
+            // 主按键事件处理
+            document.addEventListener('keydown', (e) => {
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                
+                const isNumpad = e.location === KeyboardEvent.DOM_KEY_LOCATION_NUMPAD;
+                let key = e.key;
+                
+                if (isNumpad) {
+                    // 处理小键盘按键
+                    key = key.replace('Numpad', '');
+                    
+                    // 特殊键处理
+                    if (key === 'Enter') key = 'Enter';
+                    if (key === 'Decimal') key = '.';
+                    
+                    handleKeyDown(key);
+                    
+                    e.preventDefault();
+                }
+            });
+            
+            document.addEventListener('keyup', (e) => {
+                const isNumpad = e.location === KeyboardEvent.DOM_KEY_LOCATION_NUMPAD;
+                let key = e.key;
+                
+                if (isNumpad) {
+                    key = key.replace('Numpad', '');
+                    
+                    // 特殊键处理
+                    if (key === 'Enter') key = 'Enter';
+                    if (key === 'Decimal') key = '.';
+                    
+                    handleKeyUp(key);
+                    
+                    e.preventDefault();
+                }
+            });
+            
+            // 添加鼠标点击小键盘的交互
+            numpadKeys.forEach(key => {
+                key.addEventListener('mousedown', () => {
+                    if (!audioContext) {
+                        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    }
+                    
+                    const keyValue = key.dataset.key;
+                    handleKeyDown(keyValue);
+                });
+                
+                key.addEventListener('mouseup', () => {
+                    const keyValue = key.dataset.key;
+                    handleKeyUp(keyValue);
+                });
+                
+                key.addEventListener('mouseleave', () => {
+                    const keyValue = key.dataset.key;
+                    if (key.classList.contains('active')) {
+                        handleKeyUp(keyValue);
+                    }
+                });
+            });
+            
+            // 音色切换按钮
+            const soundBtns = document.querySelectorAll('.sound-btn');
+            soundBtns.forEach(btn => {
+                btn.addEventListener('click', () => {
+                    // 移除所有活动状态
+                    soundBtns.forEach(b => b.classList.remove('active'));
+                    // 设置当前按钮为活动状态
+                    btn.classList.add('active');
+                    // 更新当前音色类型
+                    currentSoundType = btn.dataset.type;
+                    document.getElementById('soundType').textContent = 
+                        currentSoundType === 'piano' ? '钢琴' : 
+                        currentSoundType === 'sine' ? '正弦波' : '风琴';
+                    
+                    // 切换音色时停止所有声音
+                    Object.keys(activeOscillators).forEach(key => {
+                        stopTone(key);
+                    });
+                });
+            });
+            
+            // 添加触摸设备支持
+            document.body.addEventListener('touchstart', function() {
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                } else if (audioContext.state === 'suspended') {
+                    audioContext.resume();
+                }
+            }, false);
+        });
+    </script>
+</body>
+</html>
