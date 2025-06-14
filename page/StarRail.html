@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>星轨计划 - 跨星际高铁系统</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;500;700&display=swap');
+        body { font-family: 'Noto+Sans+SC', sans-serif; }
+
+        .hero-bg {
+            background: linear-gradient(rgba(10,25,47,0.9), rgba(10,25,47,0.7)),
+                       url('https://images.unsplash.com/photo-1462331940025-496dfbfc7564?auto=format&fit=crop&w=1920&q=80');
+            background-size: cover;
+            background-position: center;
+        }
+
+        .timeline::before {
+            content: '';
+            @apply absolute left-1/2 w-1 bg-gradient-to-b from-orange-400 to-blue-500 h-full;
+        }
+
+        .stat-card, .pricing-card {
+            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            background: linear-gradient(145deg, #112240 0%, #0a192f 100%);
+        }
+
+        .stat-card:hover, .pricing-card:hover {
+            transform: translateY(-8px);
+            box-shadow: 0 10px 30px rgba(255,77,0,0.15);
+        }
+
+        @keyframes starlight {
+            0% { opacity: 0.3; }
+            50% { opacity: 1; }
+            100% { opacity: 0.3; }
+        }
+        .star {
+            animation: starlight 3s ease-in-out infinite;
+        }
+    </style>
+</head>
+<body class="bg-[#0a192f] text-gray-100">
+    <!-- 英雄模块 -->
+    <section class="hero-bg min-h-screen flex items-center justify-center px-4">
+        <div class="text-center max-w-4xl space-y-6 relative">
+            <div class="star absolute w-2 h-2 bg-white rounded-full" style="top:20%; left:15%"></div>
+            <h1 class="text-6xl md:text-8xl font-bold bg-gradient-to-r from-orange-400 to-blue-500 bg-clip-text text-transparent">
+                星轨计划
+            </h1>
+            <p class="text-xl md:text-2xl text-gray-300">连接星系的新纪元交通网络</p>
+            <p class="text-gray-400 max-w-2xl mx-auto leading-relaxed">
+                人类历史上最宏大的基建工程，跨越光年的真空管道列车系统，将银河系主要殖民地纳入1小时交通圈
+            </p>
+            <div class="pt-8">
+                <button class="bg-[#FF4D00] hover:bg-[#FF6B35] px-8 py-3 rounded-full font-semibold transition-all transform hover:scale-105">
+                    立即探索 <i class="fas fa-arrow-right ml-2"></i>
+                </button>
+            </div>
+        </div>
+    </section>
+
+    <!-- 核心数据 -->
+    <section class="py-20 px-4">
+        <div class="max-w-6xl mx-auto grid md:grid-cols-4 gap-6">
+            <!-- 原有速度卡片 -->
+            <div class="stat-card p-6 rounded-xl border border-[#1f3a5c]">
+                <div class="h-32 bg-gradient-to-r from-red-400/20 to-orange-500/20 rounded-lg mb-4"></div>
+                <h3 class="text-2xl font-bold mb-2">0.8C</h3>
+                <p class="text-gray-400">曲速巡航最高速度</p>
+            </div>
+
+            <!-- 新增卡片 -->
+            <div class="stat-card p-6 rounded-xl border border-[#1f3a5c]">
+                <div class="h-32 bg-gradient-to-r from-green-400/20 to-emerald-500/20 rounded-lg mb-4"></div>
+                <h3 class="text-2xl font-bold mb-2">98.7%</h3>
+                <p class="text-gray-400">反物质能源利用率 <i class="fas fa-atom ml-2"></i></p>
+            </div>
+
+            <div class="stat-card p-6 rounded-xl border border-[#1f3a5c]">
+                <div class="h-32 bg-gradient-to-r from-purple-400/20 to-fuchsia-500/20 rounded-lg mb-4"></div>
+                <h3 class="text-2xl font-bold mb-2">1,248光年</h3>
+                <p class="text-gray-400">星系网络覆盖范围 <i class="fas fa-galactic-republic ml-2"></i></p>
+            </div>
+
+            <div class="stat-card p-6 rounded-xl border border-[#1f3a5c]">
+                <div class="h-32 bg-gradient-to-r from-amber-400/20 to-rose-500/20 rounded-lg mb-4"></div>
+                <h3 class="text-2xl font-bold mb-2">1,502天</h3>
+                <p class="text-gray-400">连续无事故运行 <i class="fas fa-shield-alt ml-2"></i></p>
+            </div>
+
+            <div class="stat-card p-6 rounded-xl border border-[#1f3a5c]">
+                <div class="h-32 bg-gradient-to-r from-cyan-400/20 to-blue-500/20 rounded-lg mb-4"></div>
+                <h3 class="text-2xl font-bold mb-2">48.9亿吨</h3>
+                <p class="text-gray-400">年物资运输量 <i class="fas fa-cubes ml-2"></i></p>
+            </div>
+
+            <div class="stat-card p-6 rounded-xl border border-[#1f3a5c]">
+                <div class="h-32 bg-gradient-to-r from-pink-400/20 to-red-500/20 rounded-lg mb-4"></div>
+                <h3 class="text-2xl font-bold mb-2">99.3%</h3>
+                <p class="text-gray-400">重力模拟舒适度 <i class="fas fa-user-astronaut ml-2"></i></p>
+            </div>
+
+            <div class="stat-card p-6 rounded-xl border border-[#1f3a5c]">
+                <div class="h-32 bg-gradient-to-r from-indigo-400/20 to-violet-500/20 rounded-lg mb-4"></div>
+                <h3 class="text-2xl font-bold mb-2">7.2亿吨</h3>
+                <p class="text-gray-400">量子钢材料用量 <i class="fas fa-cube ml-2"></i></p>
+            </div>
+
+            <div class="stat-card p-6 rounded-xl border border-[#1f3a5c]">
+                <div class="h-32 bg-gradient-to-r from-lime-400/20 to-teal-500/20 rounded-lg mb-4"></div>
+                <h3 class="text-2xl font-bold mb-2">+320%</h3>
+                <p class="text-gray-400">年度乘客增长率 <i class="fas fa-chart-line ml-2"></i></p>
+            </div>
+        </div>
+    </section>
+
+    <!-- 发展历程 -->
+    <section class="py-20 px-4">
+        <div class="max-w-4xl mx-auto relative">
+            <h2 class="text-4xl font-bold text-center mb-16">里程碑时刻</h2>
+            <div class="relative timeline">
+                <!-- 现有2025年节点 -->
+                <div class="mb-16 ml-8 pl-8 border-l-2 border-[#FF4D00] relative">
+                    <div class="absolute w-4 h-4 bg-[#FF4D00] rounded-full -left-[9px] top-0"></div>
+                    <div class="bg-[#112240] p-6 rounded-xl">
+                        <h4 class="text-xl font-bold mb-2">2025年 星环奠基</h4>
+                        <p class="text-gray-400">地球同步轨道首座真空管道建成...</p>
+                    </div>
+                </div>
+
+                <!-- 新增时间节点 -->
+                <div class="mb-16 ml-8 pl-8 border-l-2 border-[#FF4D00] relative">
+                    <div class="absolute w-4 h-4 bg-[#FF4D00] rounded-full -left-[9px] top-0"></div>
+                    <div class="bg-[#112240] p-6 rounded-xl">
+                        <h4 class="text-xl font-bold mb-2">2030年 首次载人测试</h4>
+                        <p class="text-gray-400">完成地球-月球轨道间首次无人驾驶测试，验证真空磁悬浮管道技术</p>
+                    </div>
+                </div>
+
+                <div class="mb-16 ml-8 pl-8 border-l-2 border-[#FF4D00] relative">
+                    <div class="absolute w-4 h-4 bg-[#FF4D00] rounded-full -left-[9px] top-0"></div>
+                    <div class="bg-[#112240] p-6 rounded-xl">
+                        <h4 class="text-xl font-bold mb-2">2040年 地月线路开通</h4>
+                        <p class="text-gray-400">首条跨天体线路正式运营，地月通行时间缩短至4小时</p>
+                    </div>
+                </div>
+
+                <div class="mb-16 ml-8 pl-8 border-l-2 border-[#FF4D00] relative">
+                    <div class="absolute w-4 h-4 bg-[#FF4D00] rounded-full -left-[9px] top-0"></div>
+                    <div class="bg-[#112240] p-6 rounded-xl">
+                        <h4 class="text-xl font-bold mb-2">2050年 火星快线启航</h4>
+                        <p class="text-gray-400">首班火星殖民地带际列车发车，单程仅需38地球日</p>
+                    </div>
+                </div>
+
+                <div class="mb-16 ml-8 pl-8 border-l-2 border-[#FF4D00] relative">
+                    <div class="absolute w-4 h-4 bg-[#FF4D00] rounded-full -left-[9px] top-0"></div>
+                    <div class="bg-[#112240] p-6 rounded-xl">
+                        <h4 class="text-xl font-bold mb-2">2060年 星际网络形成</h4>
+                        <p class="text-gray-400">完成太阳系内12个主要空间站的管道连接</p>
+                    </div>
+                </div>
+
+                <div class="mb-16 ml-8 pl-8 border-l-2 border-[#FF4D00] relative">
+                    <div class="absolute w-4 h-4 bg-[#FF4D00] rounded-full -left-[9px] top-0"></div>
+                    <div class="bg-[#112240] p-6 rounded-xl">
+                        <h4 class="text-xl font-bold mb-2">2075年 曲速中继站</h4>
+                        <p class="text-gray-400">应用新型阿尔库贝利驱动技术，列车巡航速度突破0.3C</p>
+                    </div>
+                </div>
+
+                <div class="mb-16 ml-8 pl-8 border-l-2 border-[#FF4D00] relative">
+                    <div class="absolute w-4 h-4 bg-[#FF4D00] rounded-full -left-[9px] top-0"></div>
+                    <div class="bg-[#112240] p-6 rounded-xl">
+                        <h4 class="text-xl font-bold mb-2">2090年 外星系接入</h4>
+                        <p class="text-gray-400">首条跨恒星系线路开通，连接比邻星b殖民地</p>
+                    </div>
+                </div>
+
+                <div class="mb-16 ml-8 pl-8 border-l-2 border-[#FF4D00] relative">
+                    <div class="absolute w-4 h-4 bg-[#FF4D00] rounded-full -left-[9px] top-0"></div>
+                    <div class="bg-[#112240] p-6 rounded-xl">
+                        <h4 class="text-xl font-bold mb-2">22世纪中叶 银河通衢</h4>
+                        <p class="text-gray-400">完成银河系四大旋臂主干网络建设，正式实现1小时交通圈</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- 热门目的地 -->
+    <section class="py-20 px-4 bg-gradient-to-b from-[#0a192f] to-[#112240]">
+        <div class="max-w-6xl mx-auto">
+            <h2 class="text-4xl font-bold text-center mb-16">星际枢纽</h2>
+            <div class="grid md:grid-cols-3 gap-8">
+                <!-- 原有火星卡片... -->
+                
+                <!-- 比邻星枢纽（4.24光年） -->
+                <div class="stat-card p-6 rounded-xl border border-[#1f3a5c]">
+                    <div class="h-48 bg-gradient-to-r from-purple-400/20 to-pink-500/20 rounded-lg mb-4"></div>
+                    <h3 class="text-xl font-bold mb-2">比邻星b轨道站</h3>
+                    <div class="flex justify-between text-sm text-gray-400 mb-4">
+                        <span><i class="fas fa-clock mr-2"></i>1.2小时</span>
+                        <span><i class="fas fa-train mr-2"></i>96班/日</span>
+                    </div>
+                    <button class="w-full bg-[#FF4D00]/20 hover:bg-[#FF4D00]/30 text-[#FF4D00] py-2 rounded-lg transition-all">
+                        三体世界专列
+                    </button>
+                </div>
+
+                <!-- 天仓五枢纽（11.9光年） -->
+                <div class="stat-card p-6 rounded-xl border border-[#1f3a5c]">
+                    <div class="h-48 bg-gradient-to-r from-emerald-400/20 to-cyan-500/20 rounded-lg mb-4"></div>
+                    <h3 class="text-xl font-bold mb-2">天仓五戴森环</h3>
+                    <div class="flex justify-between text-sm text-gray-400 mb-4">
+                        <span><i class="fas fa-clock mr-2"></i>3.4小时</span>
+                        <span><i class="fas fa-train mr-2"></i>48班/日</span>
+                    </div>
+                    <button class="w-full bg-[#FF4D00]/20 hover:bg-[#FF4D00]/30 text-[#FF4D00] py-2 rounded-lg transition-all">
+                        恒星能源专线
+                    </button>
+                </div>
+
+                <!-- 参宿四枢纽（724光年） -->
+                <div class="stat-card p-6 rounded-xl border border-[#1f3a5c]">
+                    <div class="h-48 bg-gradient-to-r from-rose-400/20 to-amber-500/20 rounded-lg mb-4"></div>
+                    <h3 class="text-xl font-bold mb-2">参宿四星门</h3>
+                    <div class="flex justify-between text-sm text-gray-400 mb-4">
+                        <span><i class="fas fa-clock mr-2"></i>8小时</span>
+                        <span><i class="fas fa-train mr-2"></i>12班/周</span>
+                    </div>
+                    <button class="w-full bg-[#FF4D00]/20 hover:bg-[#FF4D00]/30 text-[#FF4D00] py-2 rounded-lg transition-all">
+                        红巨星观测专列
+                    </button>
+                </div>
+
+                <!-- 半人马座α枢纽（4.37光年） -->
+                <div class="stat-card p-6 rounded-xl border border-[#1f3a5c]">
+                    <div class="h-48 bg-gradient-to-r from-sky-400/20 to-indigo-500/20 rounded-lg mb-4"></div>
+                    <h3 class="text-xl font-bold mb-2">半人马座α枢纽</h3>
+                    <div class="flex justify-between text-sm text-gray-400 mb-4">
+                        <span><i class="fas fa-clock mr-2"></i>1.5小时</span>
+                        <span><i class="fas fa-train mr-2"></i>64班/日</span>
+                    </div>
+                    <button class="w-full bg-[#FF4D00]/20 hover:bg-[#FF4D00]/30 text-[#FF4D00] py-2 rounded-lg transition-all">
+                        三联星直通车
+                    </button>
+                </div>
+
+                <!-- 猎户座大星云（1,344光年） -->
+                <div class="stat-card p-6 rounded-xl border border-[#1f3a5c]">
+                    <div class="h-48 bg-gradient-to-r from-violet-400/20 to-fuchsia-500/20 rounded-lg mb-4"></div>
+                    <h3 class="text-xl font-bold mb-2">猎户座星云站</h3>
+                    <div class="flex justify-between text-sm text-gray-400 mb-4">
+                        <span><i class="fas fa-clock mr-2"></i>15小时</span>
+                        <span><i class="fas fa-train mr-2"></i>4班/月</span>
+                    </div>
+                    <button class="w-full bg-[#FF4D00]/20 hover:bg-[#FF4D00]/30 text-[#FF4D00] py-2 rounded-lg transition-all">
+                        星云观测专列
+                    </button>
+                </div>
+
+                <!-- 仙女座星系（250万光年） -->
+                <div class="stat-card p-6 rounded-xl border border-[#1f3a5c]">
+                    <div class="h-48 bg-gradient-to-r from-blue-400/20 to-purple-500/20 rounded-lg mb-4"></div>
+                    <h3 class="text-xl font-bold mb-2">仙女座枢纽</h3>
+                    <div class="flex justify-between text-sm text-gray-400 mb-4">
+                        <span><i class="fas fa-clock mr-2"></i>22小时</span>
+                        <span><i class="fas fa-train mr-2"></i>1班/季度</span>
+                    </div>
+                    <button class="w-full bg-[#FF4D00]/20 hover:bg-[#FF4D00]/30 text-[#FF4D00] py-2 rounded-lg transition-all">
+                        星系际特快
+                    </button>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- 套餐计划 -->
+    <section class="py-20 px-4">
+        <div class="max-w-6xl mx-auto">
+            <h2 class="text-4xl font-bold text-center mb-16">旅行套餐</h2>
+            <div class="grid md:grid-cols-3 gap-8">
+                <!-- 经济舱套餐 -->
+                <div class="pricing-card p-8 rounded-xl border border-[#1f3a5c]">
+                    <div class="text-gray-400 text-2xl font-bold mb-4">深空经济舱</div>
+                    <div class="text-4xl font-bold mb-6">¥4,999<span class="text-lg text-gray-400">/单程</span></div>
+                    <ul class="space-y-3 mb-8">
+                        <li class="flex items-center text-gray-400"><i class="fas fa-check mr-2"></i>5次近地轨道行程</li>
+                        <li class="flex items-center text-gray-400"><i class="fas fa-times mr-2"></i>无行李托运</li>
+                        <li class="flex items-center text-gray-400"><i class="fas fa-times mr-2"></i>限重15kg</li>
+                    </ul>
+                    <button class="w-full bg-gray-600/20 hover:bg-gray-600/30 text-gray-400 py-3 rounded-lg transition-all">
+                        基础订购
+                    </button>
+                </div>
+
+                <!-- 商务优先套餐 -->
+                <div class="pricing-card p-8 rounded-xl border border-[#1f3a5c]">
+                    <div class="text-blue-400 text-2xl font-bold mb-4">星云商务舱</div>
+                    <div class="text-4xl font-bold mb-6">¥24,999<span class="text-lg text-gray-400">/黄金舱</span></div>
+                    <ul class="space-y-3 mb-8">
+                        <li class="flex items-center"><i class="fas fa-check text-[#FF4D00] mr-2"></i>30次跨星系行程</li>
+                        <li class="flex items-center"><i class="fas fa-check text-[#FF4D00] mr-2"></i>VIP专属通道</li>
+                        <li class="flex items-center"><i class="fas fa-check text-[#FF4D00] mr-2"></i>3件超规行李</li>
+                    </ul>
+                    <button class="w-full bg-[#FF4D00] hover:bg-[#FF6B35] py-3 rounded-lg transition-all">
+                        优先订购
+                    </button>
+                </div>
+
+                <!-- 星际企业套餐 -->
+                <div class="pricing-card p-8 rounded-xl border border-[#1f3a5c]">
+                    <div class="text-purple-400 text-2xl font-bold mb-4">企业通勤计划</div>
+                    <div class="text-4xl font-bold mb-6">¥99,999<span class="text-lg text-gray-400">/年度</span></div>
+                    <ul class="space-y-3 mb-8">
+                        <li class="flex items-center"><i class="fas fa-check text-[#FF4D00] mr-2"></i>无限次行程</li>
+                        <li class="flex items-center"><i class="fas fa-check text-[#FF4D00] mr-2"></i>10人团队账户</li>
+                        <li class="flex items-center"><i class="fas fa-check text-[#FF4D00] mr-2"></i>实时行程分析</li>
+                    </ul>
+                    <button class="w-full bg-[#FF4D00] hover:bg-[#FF6B35] py-3 rounded-lg transition-all">
+                        企业采购
+                    </button>
+                </div>
+
+                <!-- 银河尊享套餐 -->
+                <div class="pricing-card p-8 rounded-xl border border-[#1f3a5c]">
+                    <div class="text-amber-400 text-2xl font-bold mb-4">银河尊享</div>
+                    <div class="text-4xl font-bold mb-6">¥199,999<span class="text-lg text-gray-400">/终身</span></div>
+                    <ul class="space-y-3 mb-8">
+                        <li class="flex items-center"><i class="fas fa-check text-[#FF4D00] mr-2"></i>私人轨道定制</li>
+                        <li class="flex items-center"><i class="fas fa-check text-[#FF4D00] mr-2"></i>星际管家服务</li>
+                        <li class="flex items-center"><i class="fas fa-check text-[#FF4D00] mr-2"></i>全星系贵宾厅</li>
+                    </ul>
+                    <button class="w-full bg-[#FF4D00] hover:bg-[#FF6B35] py-3 rounded-lg transition-all">
+                        尊享预约
+                    </button>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- 预订系统 -->
+    <section class="py-20 px-4 bg-[#112240]">
+        <div class="max-w-3xl mx-auto rounded-xl p-8">
+            <h2 class="text-3xl font-bold mb-8 text-center">星际旅程规划</h2>
+            <form class="space-y-6">
+                <div class="grid md:grid-cols-2 gap-6">
+                    <!-- 出发站选择 -->
+                    <div>
+                        <label class="block mb-3 text-gray-300">出发站</label>
+                        <div class="input-wrapper">
+                            <!-- 出发站选择 -->
+                            <select id="departure-select" class="w-full bg-[#0a192f] rounded-lg p-3 focus:ring-2 focus:ring-[#FF4D00] outline-none">
+                                <option value="earth">地球中央站（近地轨道）</option>
+                                <option value="moon">月球门户站（静海基地）</option>
+                                <option value="mars">火星新城枢纽（乌托邦平原）</option>
+                                <option value="jupiter">木星轨道中转站（伽利略港）</option>
+                                <option value="saturn">土星环空间站（泰坦星港）</option>
+                                <option value="proxima">比邻星b轨道站（三体世界）</option>
+                                <option value="tau_ceti">天仓五戴森环（第二地球）</option>
+                                <option value="betelgeuse">参宿四星门（猎户座臂旋）</option>    
+                                <option value="venus">金星云顶城（麦哲伦穹顶）</option>
+                                <option value="ceres">谷神星中转站（小行星带）</option>
+                                <option value="europa">欧罗巴深海站（木卫二）</option>
+                                <option value="alpha_centauri">半人马座α枢纽（南门二）</option>
+                                <option value="orion_nebula">猎户座星云站（创生之柱）</option>
+                                <option value="andromeda">仙女座枢纽（M31核心区）</option>
+                                <option value="magellanic">麦哲伦星云站（NGC 2070）</option>
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <!-- 抵达站选择 -->
+                    <div>
+                        <label class="block mb-3 text-gray-300">抵达站</label>
+                        <div class="input-wrapper">
+                            <!-- 抵达站选择 -->
+                            <select id="arrival-select" class="w-full bg-[#0a192f] rounded-lg p-3 focus:ring-2 focus:ring-[#FF4D00] outline-none">
+                                <option value="earth">地球中央站（近地轨道）</option>
+                                <option value="moon">月球门户站（静海基地）</option>
+                                <option value="mars">火星新城枢纽（乌托邦平原）</option>
+                                <option value="jupiter">木星轨道中转站（伽利略港）</option>
+                                <option value="saturn">土星环空间站（泰坦星港）</option>
+                                <option value="proxima">比邻星b轨道站（三体世界）</option>
+                                <option value="tau_ceti">天仓五戴森环（第二地球）</option>
+                                <option value="betelgeuse">参宿四星门（猎户座臂旋）</option>
+                                <option value="venus">金星云顶城（麦哲伦穹顶）</option>
+                                <option value="ceres">谷神星中转站（小行星带）</option>
+                                <option value="europa">欧罗巴深海站（木卫二）</option>
+                                <option value="alpha_centauri">半人马座α枢纽（南门二）</option>
+                                <option value="orion_nebula">猎户座星云站（创生之柱）</option>
+                                <option value="andromeda">仙女座枢纽（M31核心区）</option>
+                                <option value="magellanic">麦哲伦星云站（NGC 2070）</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+                <button class="w-full bg-[#FF4D00] hover:bg-[#FF6B35] py-4 rounded-lg font-semibold transition-all">
+                    查询可用班次 <i class="fas fa-search ml-2"></i>
+                </button>
+            </form>
+        </div>
+    </section>
+
+    <!-- 页脚 -->
+    <footer class="border-t border-[#1f3a5c]">
+        <div class="max-w-6xl mx-auto py-12 px-4 grid md:grid-cols-3 gap-8">
+            <div>
+                <h3 class="text-xl font-bold mb-4">星轨计划</h3>
+                <p class="text-gray-400 leading-relaxed">致力于构建安全高效的星际交通网络...</p>
+            </div>
+            <div>
+                <h3 class="text-xl font-bold mb-4">联系我们</h3>
+                <ul class="space-y-2 text-gray-400">
+                    <li><i class="fas fa-envelope mr-2"></i>contact@stella-rail.com</li>
+                    <li><i class="fas fa-phone mr-2"></i>+86 400 1234 5678</li>
+                </ul>
+            </div>
+            <div>
+                <h3 class="text-xl font-bold mb-4">关注我们</h3>
+                <div class="flex space-x-4">
+                    <a href="#" class="text-2xl text-[#FF4D00] hover:text-[#FF6B35]"><i class="fab fa-weibo"></i></a>
+                    <a href="#" class="text-2xl text-[#FF4D00] hover:text-[#FF6B35]"><i class="fab fa-weixin"></i></a>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        // 滚动动画
+        const observer = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    entry.target.classList.add('opacity-100', 'translate-y-0');
+                    entry.target.style.transition = 'all 0.6s cubic-bezier(0.4, 0, 0.2, 1)';
+                }
+            });
+        }, { threshold: 0.1 });
+
+        document.querySelectorAll('.stat-card, .pricing-card, .timeline > div').forEach(el => {
+            el.classList.add('opacity-0', 'translate-y-20');
+            observer.observe(el);
+        });
+
+        // 表单交互
+        // 表单交互
+        document.querySelectorAll('.input-wrapper').forEach(wrapper => {
+            const input = wrapper.querySelector('input, select, textarea');
+            input.addEventListener('focus', () => {
+                wrapper.classList.add('ring-2', 'ring-[#FF4D00]');  // 作用于包裹层
+            });
+            input.addEventListener('blur', () => {
+                wrapper.classList.remove('ring-2', 'ring-[#FF4D00]');
+            });
+        });
+
+        // 动态更新抵达站选项
+        const departureSelect = document.querySelector('#departure-select');
+        const arrivalSelect = document.querySelector('#arrival-select');
+        
+        function updateArrivalOptions() {
+            const selectedDeparture = departureSelect.value;
+            // 更新选项状态
+            Array.from(arrivalSelect.options).forEach(option => {
+                option.disabled = option.value === selectedDeparture;
+                option.style.opacity = option.disabled ? '0.5' : '1';
+            });
+            
+            // 新增：自动切换当前值
+            if (arrivalSelect.value === selectedDeparture) {
+                const firstAvailable = Array.from(arrivalSelect.options).find(opt => !opt.disabled);
+                if (firstAvailable) arrivalSelect.value = firstAvailable.value;
+            }
+        }
+
+        departureSelect.addEventListener('change', updateArrivalOptions);
+        
+        // 初始化时更新一次
+        updateArrivalOptions();
+    </script>
+</body>
+</html>
