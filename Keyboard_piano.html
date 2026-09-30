@@ -484,7 +484,7 @@
         <div class="status-container">
             <div class="status">当前按下：<span id="currentKey">-</span></div>
             <div class="visual-key" id="visualKeyDisplay"></div>
-            <div class="hint">使用键盘上的字母键或点击下方按键演奏音符 · 按 F1 自动演奏《打上花火》（谱子作者：呱呱能有什么坏心思），再按一次中止；若笔记本软件劫持了 F1，可用 Shift+S 代替</div>
+            <div class="hint">使用键盘上的字母键或点击下方按键演奏音符 · 按 F1 自动演奏《打上花火》（谱子作者：呱呱能有什么坏心思），再按一次中止</div>
         </div>
         
         <div class="piano-container">
@@ -878,12 +878,18 @@
             }
 
             // 颤音 LFO，depth 单位为音分（cents）
+            // target 可以是单个 AudioParam，也可以是数组 —— 合奏弦乐、多音栓风琴
+            // 需要同一条 LFO 同时调制好几个振荡器（各建一条 LFO 会互相错开相位）。
             function vibrato(target, t, rate, cents, delay) {
                 const lfo = osc('sine', rate);
                 const g = ctx.createGain();
                 g.gain.setValueAtTime(0, t);
                 g.gain.linearRampToValueAtTime(cents, t + delay + 0.15);
-                lfo.connect(g).connect(target);
+                lfo.connect(g);
+                const list = Array.isArray(target) ? target : [target];
+                for (let i = 0; i < list.length; i++) {
+                    if (list[i]) g.connect(list[i]);
+                }
                 return lfo;
             }
 
@@ -1012,36 +1018,169 @@
                 };
             }
 
+            /* ---- 直接按函数采样的包络表 ----
+             * buildEnvelope 用贝塞尔描述"两段式"自由衰减；但加性合成的每个部分音
+             * 本来就是一条纯指数曲线，它的和（复合包络）用贝塞尔反而拟合不准。
+             * 这张表只给 release() 查表用（抬键时判断"此刻还剩多少、斜率多陡"），
+             * 不参与音频自动化，所以直接按函数采样最准确。
+             *
+             * 指数衰减的约定（与下面 expGain 一致）：
+             *     gain(x) = a · (EPS/a)^(x/life)
+             * 即从 a 起，经过 life 秒恰好落到 EPS（约 -66 dB 行程）。
+             */
+            function expGain(x, a, life) {
+                return a * Math.pow(EPS / a, Math.min(1, Math.max(0, x / life)));
+            }
+
+            function sampleEnvelope(tRef, dur, levelFn) {
+                const N = 512, dt = dur / N;
+                const lv = new Float32Array(N + 1);
+                for (let i = 0; i <= N; i++) lv[i] = Math.max(levelFn(i * dt), 0);
+                const pk = Math.max(lv[0], 1e-9);
+                lv[N] = 0;
+                const db = new Float32Array(N + 1), k = new Float32Array(N + 1);
+                for (let i = 0; i <= N; i++) {
+                    db[i] = 20 * Math.log10(Math.max(lv[i], 1e-9) / pk);
+                }
+                for (let i = 0; i <= N; i++) {
+                    const i0 = Math.max(0, i - 1), i1 = Math.min(N, i + 1);
+                    k[i] = (db[i1] - db[i0]) / ((i1 - i0) * dt);
+                }
+                return { lv: lv, db: db, k: k, dt: dt, N: N, pk: pk, dur: dur, atk: 0, tRef: tRef };
+            }
+
             /* ---------------- 各音色 ---------------- */
 
-            // 钢琴：锯齿波 + 正弦基音 + 低频滤波器。
-            // 自然衰减按调查结论做成"两段式"贝塞尔（前 ~13% 时间快掉到 42%，
-            // 之后转慢尾直到 dur）。整条包络排成自动化点，按住多久都只是越来越轻，
-            // 不会在中途"断气"；抬键时再查此刻的电平/斜率来配止音速度。
+            /* ---- 钢琴：加性合成（弦刚度失谐 + 双极化拍频 + 击弦瞬态）----
+             *
+             * 原来是一个锯齿波 + 正弦 + 固定 2000Hz 低通。那个结构的问题是：
+             *   1. 锯齿波的泛音是严格整数倍 —— 真实钢琴的弦有刚度，部分音会被
+             *      "拉伸"（高次部分音偏高），这是耳朵判断"像不像钢琴"最关键的线索，
+             *      整谐波叠出来就是电子琴味；
+             *   2. 所有泛音共用一条衰减包络，于是整条音从头到尾同一个音色。
+             *      真实钢琴是**高次部分音先死**：音头亮、随后逐渐转暗；
+             *   3. 没有击弦瞬态，也就是"槌子敲上去"那一下撞击声；
+             *   4. 那个 5Hz 颤音 LFO 是合成器式的摇摆，钢琴没有颤音。
+             *
+             * 现在的做法（参照 Smith & Van Duyne 的钢琴模型思路与加性合成实践）：
+             *   · 部分音频率按弦刚度拉伸：f_n = n·f0·√(1 + B·n²)，B 随音高变化
+             *     （低音弦粗、B 大；高音 B 小）；
+             *   · 每个部分音有自己的衰减时长，且高次部分音衰减快得多 ——
+             *     音色自然由亮转暗，不需要滤波器扫频去凑；
+             *   · 每根弦的振动分两个极化方向：频率差几音分、衰减快慢不同。
+             *     两者的拍频正是钢琴那层微微闪烁的余韵与"两段式衰减"的来源
+             *     （文献把两段衰减归因于弦之间/极化之间的轻微失谐）；
+             *   · 一小段带通噪声做击弦瞬态；
+             *   · 力度越大越亮、越响（部分音滚降的高频截止与噪声量都跟力度走）。
+             */
+            const PIANO_PARTIALS = 14;        // 部分音个数上限
+            const PIANO_PARTIALS_LOW = 20;    // 低音弦更长，需要更多部分音才够亮
+            const PIANO_B_MID = 0.0004;       // A4 附近的弦刚度系数（实测量级）
+            const PIANO_FMAX = 9000;          // 超过这个频率的部分音不生成
+
+            function pianoStiffness(f0) {
+                // 实测趋势：低音区 B 明显更大（弦粗而长），高音区小
+                return Math.min(0.0012, Math.max(0.00008,
+                    PIANO_B_MID * Math.pow(440 / Math.max(f0, 20), 0.45)));
+            }
+
             BUILD.piano = function (freq, dur, vel, t) {
                 const v = newVoice(0.10);
-                const mainOsc = osc('sawtooth', freq);
-                const subOsc = osc('sine', freq);
-                const lfo = osc('sine', 5);
-                const lfoGain = gain(0.8);
-                const filter = ctx.createBiquadFilter();
-                filter.type = 'lowpass';
-                filter.frequency.value = 2000;
-                filter.Q.value = 1;
-                const mainGain = ctx.createGain();
-                const PK = Math.max(0.3 * vel, EPS);
-                mainGain.gain.setValueAtTime(0, t);
-                mainGain.gain.linearRampToValueAtTime(PK, t + 0.02);
-                scheduleEnvelope(mainGain.gain, v,
-                    buildEnvelope({ dur: dur - 0.02, peak: PK, atk: 0.02,
-                                    xa: 0.12, ya: 0.42, xb: 0.82, yb: 0 }), t + 0.02);
-                const subGain = gain(0.2);
-                lfo.connect(lfoGain).connect(mainOsc.detune);
-                mainOsc.connect(filter);
-                subOsc.connect(subGain).connect(filter);
-                filter.connect(mainGain).connect(v.out);
-                v.srcs.push(mainOsc, subOsc, lfo);
-                v.cap = dur + 0.1;
+                const B = pianoStiffness(freq);
+                // 力度 -> 亮度：硬击弦时槌子接触时间短、高频更多
+                const bright = 0.42 + 0.72 * vel;
+                const fCut = 4600 * bright * Math.pow(440 / Math.max(freq, 20), 0.20);
+                // 每次触键加一点点随机失谐（±0.8 音分）：真实钢琴不可能每次都
+                // 分毫不差，重复同一个音时才不会听起来像复读机
+                const drift = 1 + (Math.random() * 2 - 1) * 0.00046;
+
+                // 1) 先算好各部分音的原始幅度，再整体归一化 —— 所有部分音在 t 时刻
+                //    同相叠加，不归一化的话音头会直接冲顶（削波）
+                const raw = [];
+                let sum = 0;
+                const maxN = freq < 200 ? PIANO_PARTIALS_LOW : PIANO_PARTIALS;
+                for (let n = 1; n <= maxN; n++) {
+                    const f = n * freq * Math.sqrt(1 + B * n * n) * drift;
+                    if (f > PIANO_FMAX) break;
+                    // 滚降要比"锯齿波"温和得多：实测钢琴在强奏时第 8~10 次部分音
+                    // 大约只低 20 dB 左右。压得太狠会只剩基音，音色发闷、也失去了
+                    // "高次先死→由亮转暗"的余地（这正是上一版谱心几乎不动的原因）。
+                    const a = Math.pow(n, -0.62) * Math.exp(-Math.pow(n * freq / fCut, 1.4));
+                    raw.push({ f: f, a: a, n: n });
+                    sum += a;
+                }
+                if (!raw.length) raw.push({ f: freq, a: 1, n: 1 });
+                // 跨音区响度补偿：低音部分音多，按"幅度和"归一化之后基音反而偏小，
+                // 实测低音会比高音轻约 6 dB。按 261.6Hz 为基准做一点倾斜补回来。
+                const tilt = Math.pow(261.6 / Math.max(freq, 20), 0.22);
+                const master = Math.max(0.42 * vel * tilt, EPS);
+                const scale = master / Math.max(sum, EPS);
+
+                // 每个部分音的衰减时长：基音用满 dur，高次按 n^0.7 缩短
+                // （声导板对各频率的阻尼大致相当，所以频率越高衰减越快）
+                const lifeOf = function (n) {
+                    return Math.max(0.05, dur / Math.pow(n, 0.7));
+                };
+                // 复合包络（基音的两个极化分量之和）给 release() 查表用
+                const n1 = raw[0], life1 = lifeOf(1);
+                const gF = n1.a * scale * 0.62, gS = n1.a * scale * 0.38;
+                const lifeF = Math.max(0.04, life1 * 0.5), lifeS = life1 * 1.15;
+                v.envs.push(sampleEnvelope(t, dur, function (x) {
+                    return expGain(x, gF, lifeF) + expGain(x, gS, lifeS);
+                }));
+
+                for (let i = 0; i < raw.length; i++) {
+                    const P = raw[i];
+                    const life = lifeOf(P.n);
+                    // 2) 双极化：同一部分音两条频率相差几音分的"弦"，衰减一快一慢。
+                    //    拍频 + 不同衰减 = 钢琴特有的两段式余韵与闪烁感。
+                    //    只对低次部分音成对（拍频在 0.3~3 Hz，听得出来）；高次部分音
+                    //    本来就死得快、拍频又在 4 Hz 以上听不出单独的一次颤动，
+                    //    用单条可以省掉近一半节点。
+                    if (P.n <= 6) {
+                        const beat = 1.1 + 0.16 * P.n;          // 音分
+                        const parts = [
+                            { f: P.f * Math.pow(2, -beat / 2400), a: P.a * scale * 0.62,
+                              life: Math.max(0.04, life * 0.5) },
+                            { f: P.f * Math.pow(2, beat / 2400), a: P.a * scale * 0.38,
+                              life: life * 1.15 }
+                        ];
+                        for (let j = 0; j < parts.length; j++) {
+                            const q = parts[j];
+                            const o = osc('sine', q.f);
+                            const g = ctx.createGain();
+                            g.gain.setValueAtTime(Math.max(q.a, EPS), t);
+                            g.gain.exponentialRampToValueAtTime(EPS, t + q.life);
+                            o.connect(g).connect(v.out);
+                            v.srcs.push(o);
+                        }
+                    } else {
+                        const a = P.a * scale;
+                        const o = osc('sine', P.f);
+                        const g = ctx.createGain();
+                        g.gain.setValueAtTime(Math.max(a, EPS), t);
+                        g.gain.exponentialRampToValueAtTime(EPS, t + life);
+                        o.connect(g).connect(v.out);
+                        v.srcs.push(o);
+                    }
+                }
+
+                // 3) 击弦瞬态：一小段带通噪声，"槌子敲在弦上"的那一下。
+                //    中心频率不跟着音高线性走（否则低音那一下会闷得听不见），
+                //    带宽放宽一点，更像"撞击"而非"哨声"。
+                const knock = noiseSource(false);
+                const bp = ctx.createBiquadFilter();
+                bp.type = 'bandpass';
+                bp.frequency.value = Math.min(4500, Math.max(1000, freq * 4));
+                bp.Q.value = 0.5;
+                const kg = ctx.createGain();
+                const kAmp = 0.04 * Math.pow(vel, 1.3);
+                kg.gain.setValueAtTime(Math.max(kAmp, EPS), t);
+                kg.gain.exponentialRampToValueAtTime(EPS, t + 0.03);
+                knock.connect(bp).connect(kg).connect(v.out);
+                v.srcs.push(knock);
+
+                v.cap = dur + 0.2;
                 return v;
             };
 
@@ -1051,8 +1190,8 @@
                 const v = newVoice(0.22);
                 const layers = [
                     // [倍频, 调制指数, 调制衰减, 层音量, 自然衰减总时长, 拐点位置, 拐点电平]
-                    [1.0, 2.2 * vel, 0.90, 0.34, Math.min(dur, 4.5), 0.10, 0.50],
-                    [14.0, 1.4 * vel, 0.10, 0.06, 0.90, 0.30, 0.30]
+                    [1.0, 2.2 * vel, 0.90, 0.25, Math.min(dur, 4.5), 0.10, 0.50],
+                    [14.0, 1.4 * vel, 0.10, 0.045, 0.90, 0.30, 0.30]
                 ];
                 // 调查结论：Rhodes 的 tine 振动带延长音，峰值以下 -20dB 约需 1.6s
                 // （≈12.5 dB/s），比钢琴慢得多；前段是敲击瞬态的快速跌落。
@@ -1118,29 +1257,31 @@
                     idx = (idx + 1) % N;
                 }
 
-                // 按 RMS 归一化。噪声激励的「峰值」每次随机抖动很大，用它归一化会让
-                // 同一个音的音量忽大忽小；RMS 稳定得多，也更贴近听感响度。
-                // 只统计拨弦后的头 0.3 秒——KS 的能量几乎都在这一段，
-                // 用整段算会被漫长的衰减尾巴稀释，反而衡量不出实际响度。
+                // 响度归一化：**先把峰值压进 ±1，再把"拨弦后 0.3 秒的 RMS"统一到目标值**。
+                // 顺序很关键 —— 先 RMS 再压峰值（原来那样）会在峰值超过 1 时再除一次峰值，
+                // 归一结果就跟着随机激励的峰值跑，同一个音每次触键的响度都在飘
+                // （听感就是"同一个音忽大忽小、发虚"）。现在无论是否触发限幅，
+                // 头部 RMS 都精确等于目标值，响度稳定。
                 const head = Math.min(len, Math.floor(ctx.sampleRate * 0.3));
+                let pk = 0;
+                for (let i = 0; i < len; i++) { const a = Math.abs(data[i]); if (a > pk) pk = a; }
+                if (pk > 0.98) {
+                    const k = 0.98 / pk;
+                    for (let i = 0; i < len; i++) data[i] *= k;
+                }
                 let sumSq = 0;
                 for (let i = 0; i < head; i++) sumSq += data[i] * data[i];
                 const headRms = Math.sqrt(sumSq / head);
                 if (headRms > 0) {
-                    const k = 0.3 / headRms;
+                    const k = 0.28 / headRms;
                     for (let i = 0; i < len; i++) data[i] *= k;
-                    let pk = 0;
-                    for (let i = 0; i < len; i++) {
-                        const a = Math.abs(data[i]);
-                        if (a > pk) pk = a;
-                    }
-                    if (pk > 1) {
-                        for (let i = 0; i < len; i++) data[i] /= pk;
-                    }
                 }
 
                 // 量一下这条波形的自然衰减速率（dB/s）。Karplus-Strong 的放能快慢
                 // 随音高变化，抬键加速得按每个音自己的速率算，不能用固定值。
+                // 注意：这个速率是从"这一次随机激励"测出来的，会随激励的频谱成分浮动，
+                // 所以它只用来配止音速度（止音时长本身有上下限，误差影响有限），
+                // 绝不能用它决定音符的寿命 —— 见下面 eDur 的下限。
                 const win = Math.max(1, Math.floor(sr * 0.02));
                 let refVal = 0, refIdx = 0;
                 for (let i = 0; i + win <= len; i += win) {
@@ -1169,8 +1310,11 @@
                 // 止音时长据此封顶；实际发声的电平由 Buffer 本身决定。
                 const kk = Math.max(ks.decayDb, 2);              // dB/s
                 const audT = 46 / kk;                            // 峰值以下 -46dB ≈ 听不见
-                const eDur = Math.min(Math.max(audT, 0.4), dur + 0.6);
-                const PK = Math.max(0.5 * vel, EPS);
+                // 下限给足 1.5 秒：衰减速率是从随机激励测出来的，估算偏快时若用它定
+                // 包络寿命，音符会在 0.4 秒处被硬淡掉（同一个音忽长忽短）。
+                // 弦自己的衰减本来就在波形里，包络不该去掐它。
+                const eDur = Math.min(Math.max(audT, 1.5), dur + 0.6);
+                const PK = Math.max(0.46 * vel, EPS);
                 const g = v.out.gain;
                 g.setValueAtTime(0, t);
                 g.linearRampToValueAtTime(PK, t + 0.004);
@@ -1190,7 +1334,20 @@
                 tone.frequency.value = 4200;
                 tone.Q.value = 0.6;
                 src.connect(hp).connect(body).connect(tone).connect(v.out);
-                v.srcs.push(src);
+
+                // 拨弦瞬态：指甲/拨片蹭到弦的那一下，很短很亮。
+                // 没有它，KS 的起音会显得"啪"地一下就没了轮廓，点按时尤其明显。
+                const pick = noiseSource(false);
+                const pbp = ctx.createBiquadFilter();
+                pbp.type = 'bandpass';
+                pbp.frequency.value = Math.min(6000, Math.max(1200, freq * 6));
+                pbp.Q.value = 0.7;
+                const pg = ctx.createGain();
+                pg.gain.setValueAtTime(Math.max(0.09 * vel, EPS), t);
+                pg.gain.exponentialRampToValueAtTime(EPS, t + 0.012);
+                pick.connect(pbp).connect(pg).connect(v.out);
+
+                v.srcs.push(src, pick);
                 v.cap = dur + 0.15;
                 return v;
             };
@@ -1210,7 +1367,7 @@
                     [1.0, 1.00, 2.2, 0], [2.0, 0.45, 1.3, 0],
                     [3.01, 0.30, 0.9, 4], [5.43, 0.16, 0.45, 0], [8.10, 0.08, 0.22, 0]
                 ];
-                const atk = 0.0015, scale = dur / 2.2, LV = 0.26;
+                const atk = 0.0015, scale = dur / 2.2, LV = 0.16;
                 let end = 0;
                 for (let i = 0; i < parts.length; i++) {
                     const p = parts[i];
@@ -1255,63 +1412,101 @@
 
             // 弦乐：五把失谐锯齿（-14/-7/+3/+9/+16 音分）+ 低八度锯齿，
             // 低通截止频率先冲高再回落，形成「渐强泛音」的弓弦感。
+            /* ---- 弦乐：弓弦合奏 ----
+             * 原来起音写了 0.35 秒。自动演奏点按只按住 0.15 秒，音符在到达峰值
+             * 之前就被止音器压下去了 —— 实测点按只能到长按峰值的 24%，RMS 比别的
+             * 音色低近 20 dB，听不清、发虚。真实弓弦的起音其实很快（几十毫秒），
+             * "慢起音"是错觉；这里按实测重做：
+             *   · 起音 45ms —— 点按也来得及到峰值；
+             *   · 低通不在起音阶段压着（原来从 860Hz 开始慢慢开，把最要紧的那
+             *     一百毫秒滤得又暗又轻），改成 0.1 秒内就开到位；
+             *   · 5 条失谐锯齿 + 低八度，给合奏的群感；
+             *   · 弓毛擦弦的噪声瞬态（AHD 包络）——"拉"而不是"弹"的关键；
+             *   · 按住时稳住不衰减，止音交给止音器。
+             */
             BUILD.strings = function (freq, dur, vel, t) {
                 const v = newVoice(0.30);
                 const lp = ctx.createBiquadFilter();
                 lp.type = 'lowpass';
                 lp.Q.value = 0.7;
-                lp.frequency.setValueAtTime(freq * 1.5 + 200, t);
-                lp.frequency.exponentialRampToValueAtTime(Math.min(freq * 6 + 2200, 9000), t + 0.9);
-                lp.frequency.exponentialRampToValueAtTime(Math.min(freq * 3 + 900, 5000), t + 1.5);
+                lp.frequency.setValueAtTime(freq * 5 + 1500, t);
+                lp.frequency.exponentialRampToValueAtTime(
+                    Math.min(freq * 8 + 3200, 12000), t + 0.10);
+                lp.frequency.exponentialRampToValueAtTime(
+                    Math.min(freq * 6 + 2200, 9000), t + 0.7);
                 lp.connect(v.out);
 
-                const detunes = [-14, -7, 3, 9, 16];
+                const detunes = [-13, -6, 3, 9, 15];
+                const saws = [];
                 for (let i = 0; i < detunes.length; i++) {
                     const o = osc('sawtooth', freq);
                     o.detune.value = detunes[i];
-                    o.connect(gain(0.22)).connect(lp);
+                    o.connect(gain(0.20)).connect(lp);
                     v.srcs.push(o);
+                    saws.push(o.detune);
                 }
                 const sub = osc('sawtooth', freq / 2);
-                sub.connect(gain(0.28)).connect(lp);
+                sub.connect(gain(0.22)).connect(lp);
                 v.srcs.push(sub);
+                saws.push(sub.detune);
 
-                env(v.out.gain, t, { a: 0.35, d: 0.3, s: 0.85, r: 1.2, peak: 0.34, tOff: t + dur });
-                v.cap = dur + 1.4;
+                // 弓毛擦弦：起音那一小段带通噪声，是"弓"的音色特征
+                const scrape = noiseSource(false);
+                const sbp = ctx.createBiquadFilter();
+                sbp.type = 'bandpass';
+                sbp.frequency.value = Math.min(4200, Math.max(700, freq * 5));
+                sbp.Q.value = 0.9;
+                const sg = ctx.createGain();
+                sg.gain.setValueAtTime(EPS, t);
+                sg.gain.linearRampToValueAtTime(0.14 * vel, t + 0.012);
+                sg.gain.exponentialRampToValueAtTime(EPS, t + 0.09);
+                scrape.connect(sbp).connect(sg).connect(v.out);
+                v.srcs.push(scrape);
+
+                env(v.out.gain, t, { a: 0.045, d: 0.10, s: 0.94, r: 0.45,
+                                     peak: 0.33 * vel, tOff: t + dur });
+                // 颤音延迟进入：起音那一两下不该抖。合奏的群感靠这五条一起抖。
+                v.srcs.push(vibrato(saws, t, 5.0, 7, 0.25));
+                v.cap = dur + 0.8;
                 return v;
             };
 
-            // 长笛：正弦基音 + 一点二次谐波，叠加带通白噪声模拟吹气声，
-            // 缓慢起音 + 延迟进入的颤音，是可持续音色。
+            /* ---- 长笛：正弦基音 + 一点二次谐波 + 吹气噪声 ----
+             * 与弦乐同样的毛病：起音 75ms 虽不算慢，但"气息噪声"要到 70ms 才起来，
+             * 点按（0.15 秒）里最有辨识度的那一下正好被砍掉。现在：
+             *   · 起音 45ms；
+             *   · 起音瞬间加一小段更亮更响的"气声"（chiff），这才是长笛的"吐音"；
+             *   · 之后留一点持续气声，按住时稳住；
+             *   · 颤音延迟 0.22 秒进入。
+             */
             BUILD.flute = function (freq, dur, vel, t) {
                 const v = newVoice(0.26);
                 const bodyLP = ctx.createBiquadFilter();
                 bodyLP.type = 'lowpass';
                 bodyLP.Q.value = 0.7;
-                bodyLP.frequency.value = freq * 3 + 900;
+                bodyLP.frequency.value = Math.min(freq * 4 + 1400, 12000);
                 bodyLP.connect(v.out);
 
                 const tone = osc('sine', freq);
                 tone.connect(gain(1)).connect(bodyLP);
                 const h2 = osc('sine', freq * 2);
-                h2.connect(gain(0.1)).connect(bodyLP);
+                h2.connect(gain(0.10)).connect(bodyLP);
 
+                // 气息噪声：起音处一个短促的"吐音"，随后降到持续气声
                 const nb = noiseSource(true);
                 const bp = ctx.createBiquadFilter();
                 bp.type = 'bandpass';
-                bp.Q.value = 1.4;
-                bp.frequency.value = freq * 2.2;
+                bp.Q.value = 1.0;
+                bp.frequency.value = Math.min(5200, Math.max(900, freq * 2.2));
                 const bg = ctx.createGain();
-                bg.gain.setValueAtTime(0, t);
-                bg.gain.linearRampToValueAtTime(0.2, t + 0.07);   // 起音时更「有气息」
-                bg.gain.exponentialRampToValueAtTime(0.1, t + 0.25);
-                bg.gain.setValueAtTime(0.1, t + dur);
-                bg.gain.exponentialRampToValueAtTime(EPS, t + dur + 0.16);
-                bg.gain.setValueAtTime(0, t + dur + 0.16);
+                bg.gain.setValueAtTime(EPS, t);
+                bg.gain.linearRampToValueAtTime(0.30 * vel, t + 0.020);
+                bg.gain.exponentialRampToValueAtTime(0.09 * vel, t + 0.16);
                 nb.connect(bp).connect(bg).connect(v.out);
 
-                env(v.out.gain, t, { a: 0.075, d: 0.18, s: 0.85, r: 0.16, peak: 0.40, tOff: t + dur });
-                v.srcs.push(tone, h2, nb, vibrato(tone.detune, t, 5.2, 9, 0.18));
+                env(v.out.gain, t, { a: 0.045, d: 0.09, s: 0.95, r: 0.18,
+                                     peak: 0.12 * vel, tOff: t + dur });
+                v.srcs.push(tone, h2, nb, vibrato(tone.detune, t, 5.0, 8, 0.22));
                 v.cap = dur + 0.5;
                 return v;
             };
@@ -1326,44 +1521,89 @@
                 ws.curve = crushCurve(8);
                 ws.oversample = '2x';
                 o.connect(ws).connect(v.out);
-                env(v.out.gain, t, { a: 0.001, d: 0.06, s: 0.7, r: 0.04, peak: 0.22, tOff: t + dur });
+                env(v.out.gain, t, { a: 0.001, d: 0.06, s: 0.7, r: 0.04, peak: 0.30, tOff: t + dur });
                 v.srcs.push(o, vibrato(o.detune, t, 7, 14, 0.12));
                 v.cap = dur + 0.1;
                 return v;
             };
 
-            // 风琴：三个正弦谐波叠加（保留原有实现与参数）
+            /* ---- 风琴：Hammond 式音栓（drawbar）加法合成 ----
+             * 原来只有 3 个整数倍正弦，而且写成"按住时指数衰减到 dur 就归零" ——
+             * 实测按住 1.6 秒电平掉了 44 dB，等于按住也在偷偷消失，听起来发虚。
+             * 真实风琴按住就是稳稳的一个音，离键才快速收掉。
+             *
+             * 现在按 Hammond 的音栓表做：九个音栓不是简单的 1..9 次谐波，
+             * 其中两个是"次谐波"（16' = 0.5 倍、5⅓' = 1.5 倍），并且跳过 7 次谐波。
+             * 倍频序列如下（音栓号 → 相对 8' 的倍频）：
+             *     16' 5⅓' 8' 4' 2⅔' 2' 1⅗' 1⅓' 1'
+             *     0.5 1.5 1  2  3    4  5    6    8
+             * 音栓量 0~8 换算成幅度（近似每格 3 dB，0 为静音），
+             * 再加一点点键击声与扫描颤音 —— 这两样是 Hammond 的招牌。
+             */
+            const ORGAN_BARS = [
+                // [倍频, 音栓量 0~8]   预置：8 6 8 7 0 0 0 0 0（温暖厚实、旋律低音都合用）
+                [0.5, 8], [1.5, 6], [1.0, 8], [2.0, 7], [3.0, 0],
+                [4.0, 0], [5.0, 0], [6.0, 0], [8.0, 0]
+            ];
             BUILD.organ = function (freq, dur, vel, t) {
                 const v = newVoice(0.12);
-                const levels = [0.3, 0.2, 0.15];
-                const mainGain = ctx.createGain();
-                mainGain.gain.setValueAtTime(0, t);
-                mainGain.gain.linearRampToValueAtTime(0.4, t + 0.1);
-                mainGain.gain.exponentialRampToValueAtTime(EPS, t + dur);
-                mainGain.gain.setValueAtTime(0, t + dur);
-                for (let i = 0; i < 3; i++) {
-                    const o = osc('sine', freq * (i + 1));
-                    o.connect(gain(levels[i])).connect(mainGain);
-                    v.srcs.push(o);
+                const bars = [];
+                let sum = 0;
+                for (let i = 0; i < ORGAN_BARS.length; i++) {
+                    const level = ORGAN_BARS[i][1];
+                    if (level <= 0) continue;
+                    const a = Math.pow(level / 8, 1.6);
+                    bars.push({ mul: ORGAN_BARS[i][0], a: a });
+                    sum += a;
                 }
-                mainGain.connect(v.out);
-                v.cap = dur + 0.1;
+                if (!bars.length) bars.push({ mul: 1, a: 1 });
+                // 归一化：所有音栓在 t 时刻同相叠加，不归一化会直接冲顶。
+                // 力度只作用在总音量上，别在音栓之间再乘一遍。
+                const scale = 1 / Math.max(sum, EPS);
+
+                const detunes = [];
+                for (let i = 0; i < bars.length; i++) {
+                    const o = osc('sine', freq * bars[i].mul);
+                    o.connect(gain(bars[i].a * scale)).connect(v.out);
+                    v.srcs.push(o);
+                    detunes.push(o.detune);
+                }
+
+                // 键击声：接通瞬间那一下很短的"咔"，Hammond 的标志性细节
+                const click = noiseSource(false);
+                const chp = ctx.createBiquadFilter();
+                chp.type = 'highpass';
+                chp.frequency.value = 1800;
+                const cg = ctx.createGain();
+                cg.gain.setValueAtTime(Math.max(0.04 * vel, EPS), t);
+                cg.gain.exponentialRampToValueAtTime(EPS, t + 0.006);
+                click.connect(chp).connect(cg).connect(v.out);
+                v.srcs.push(click);
+
+                // 扫描颤音：6Hz、很浅，延迟进入（起音那一下不该抖）
+                v.srcs.push(vibrato(detunes, t, 6.0, 6, 0.3));
+
+                // 起音几乎瞬时、按住稳住不衰减、离键快收 —— 风琴的真实行为
+                env(v.out.gain, t, { a: 0.006, d: 0.03, s: 1.0, r: 0.07,
+                                     peak: 0.22 * vel, tOff: t + dur });
+                v.cap = dur + 0.25;
                 return v;
             };
 
-            // 正弦波：纯正弦，起音/释放都极短
+            /* ---- 正弦波：纯正弦基准音 ----
+             * 起音 8ms、离键 80ms 淡出；按住稳住。原来固定 0.12 且不跟力度，
+             * 于是它比别的音色轻一截，而且弹轻弹响一个样。
+             */
             BUILD.sine = function (freq, dur, vel, t) {
                 const v = newVoice(0.08);
                 const o = osc('sine', freq);
                 const g = ctx.createGain();
+                g.gain.value = 1;
                 o.connect(g).connect(v.out);
-                g.gain.setValueAtTime(0, t);
-                g.gain.linearRampToValueAtTime(0.12, t + 0.01);
-                g.gain.setValueAtTime(0.12, t + dur);
-                g.gain.exponentialRampToValueAtTime(EPS, t + dur + 0.12);
-                g.gain.setValueAtTime(0, t + dur + 0.12);
+                env(v.out.gain, t, { a: 0.008, d: 0.02, s: 1.0, r: 0.08,
+                                     peak: 0.12 * vel, tOff: t + dur });
                 v.srcs.push(o);
-                v.cap = dur + 0.2;
+                v.cap = dur + 0.3;
                 return v;
             };
 
@@ -1521,6 +1761,30 @@
                 if (held === 0) reverbOpen(false, rel);
             }
 
+            // 硬掐一个声部（不是"加速衰减"，是让它立刻消失）。
+            //
+            // 为什么需要它：自动演奏的音头是提前挂到音频时钟上的（最多提前 LOOKAHEAD），
+            // 那些音源已经 start() 进音频图了。中止时只调 release() 拦不住它们 ——
+            // 已经排进去的音符仍会照常响出来，听感就是"按了停止还在弹"。
+            // 所以对"还没开始响"的声部要直接掐：停掉音源 + 断开自己的输出，
+            // 后者是保险 —— 即便某种实现下 stop 早于 start 不生效，断开输出也必然无声。
+            function cut(v) {
+                if (!v || v.released) return;
+                v.released = true;              // 之后再来 release 就什么都不做了
+                held = Math.max(0, held - 1);
+                if (held === 0) reverbOpen(false, 0.02);
+                for (let i = 0; i < v.srcs.length; i++) {
+                    try { v.srcs[i].stop(ctx.currentTime); } catch (e) {}
+                }
+                try { v.out.disconnect(); } catch (e) {}
+                if (v.revNode) { try { v.revNode.disconnect(); } catch (e) {} }
+            }
+
+            // 这个声部是否还没开始发声（音头在未来）
+            function pending(v) {
+                return !!v && !v.released && v.t > ctx.currentTime;
+            }
+
             return {
                 names: NAMES,
                 dampTimes: DAMP,
@@ -1530,7 +1794,9 @@
                 init: init,
                 unlock: unlock,
                 play: play,
-                release: release
+                release: release,
+                cut: cut,
+                pending: pending
             };
         })();
 
@@ -1551,22 +1817,22 @@
          *   · 一串连续的延时符号 = 这一段的空隙（含休止），例如 "---" 是三倍时长。
          *   · "#"、汉字数字等转调/额外八度记号无法映射到 21 键，编译时忽略。
          *   · 每一行是一句，空行分段。
-         * TIMELINE 由原始谱面离线编译而来：[键串, 起始秒, 到下一个音的空隙]（" " 为休止）。
-         * ROWS 是同一份谱面的分行显示数据：[键串, 延时符号个数, 重音数]。
+         * TIMELINE 由原始谱面离线编译而来：[键串, 起始秒, 到下一个音的空隙]，单位是
+         *   **真实秒**（COMPILE_X = 1.0，倍率 1 就是原速）。编译脚本见
+         *   《piano-autoplay-test/compile_score.py》，用的是说明书语义：
+         *   "+" 的停顿 = 《》里的数值（未标时 0.2 秒）。这一点经《打上花火》交叉验证：
+         *   原谱编译出 4:26，曲库 MIDI 版 4:27、原曲 4:33。
+         * ROWS 是同一份谱面的分行显示数据：[键串, 延时符号个数, "+"的个数]。
          * ============================================================ */
         const Score = (function () {
             'use strict';
 
-            // TIMELINE 的时间轴是"编译单位"，不是真实秒数。
-            // 真实秒数 = 编译单位 / timeScale()，timeScale() = COMPILE_X / X_UNIT。
-            //
-            // 编译当时把说明书里「《》的值 = "+" 的停顿」误当成了「"=" 的停顿 X」，
-            // 于是整条时间轴被放大了 4 倍（用原谱反推：同一份《打上花火》，
-            // 曲库 MIDI 版 4:27、按说明书语义编译为 4:26，比值 1.00）。
-            // 所以要放回原速，X_UNIT 得取 COMPILE_X 的四分之一 = 0.05。
-            // 想再快一倍就把它减半，想慢就加倍（0.1 就是"半速"，原来就是这个值）。
-            const COMPILE_X = 0.2;   // 编译时采用的单位（"+" 的停顿被当成了 0.2）
-            let X_UNIT = 0.05;       // 当前播放采用的值（可实时调速）
+            // 时间轴以真实秒为单位，所以下面两个都取 1.0，timeScale() = 1 就是原速。
+            // realSeconds = 编译单位 / timeScale()，timeScale() = COMPILE_X / X_UNIT：
+            //   · 想整体加速 → 把 X_UNIT 调小（例如 0.8 → 快 1.25 倍）
+            //   · 运行时调速走 setTempo(倍率)，不影响这里
+            const COMPILE_X = 1.0;   // 编译单位 = 秒
+            let X_UNIT = 1.0;        // 当前播放采用的值（1.0 = 原速）
 
             // 排程窗口：提前这么久把音符挂到音频时钟上。窗口越大越抗卡顿，
             // 代价是调速/跳转最多要等这么久才生效。
@@ -1584,910 +1850,1369 @@
             const HOLD_MAX = 1.0;           // 上限（秒），与演奏器的 max_hold 一致
 
             const TIMELINE = [
-["VAW",0,1.2],
-["E",1.2,1.2],
-["T",2.4,1.2],
-["Q",3.6,1.2],
-["W",4.8,1.2],
-["BSE",6,1.2],
-["T",7.2,1.2],
-["Q",8.4,1.2],
-["NDW",9.6,1.2],
-["E",10.8,1.2],
-["T",12,1.2],
-["Y",13.2,1.2],
-["W",14.4,1.2],
-["BSE",15.6,1.2],
-["H",16.8,1.2],
-["Q",18,1.2],
-["VAW",19.2,1.2],
-["E",20.4,1.2],
-["T",21.6,1.2],
-["Q",22.8,1.2],
-["W",24,1.2],
-["BSE",25.2,1.2],
-["T",26.4,1.2],
-["Q",27.6,1.2],
-["CNDGW",28.8,1.2],
-["E",30,1.2],
-["T",31.2,1.2],
-["Y",32.4,1.2],
-["W",33.6,1.2],
-["ZBDE",34.8,1.2],
-["H",36,1.2],
-["Q",37.2,1.2],
-["ZVADW",38.4,1.2],
-["ADE",39.6,1.2],
-["ADT",40.8,1.2],
-["ADQ",42,1.2],
-["ADW",43.2,1.2],
-["XBADE",44.4,1.2],
-["T",45.6,1.2],
-["ADQ",46.8,1.2],
-["CNWS",48,1.2],
-["NSE",49.2,1.2],
-["NST",50.4,1.2],
-["NSY",51.6,1.2],
-["NSW",52.8,1.2],
-["ZBSE",54,1.2],
-["NSH",55.2,1.2],
-["NSQ",56.4,1.2],
-["ZVADW",57.6,1.2],
-["ADE",58.8,1.2],
-["ADT",60,1.2],
-["ADQ",61.2,1.2],
-["ADW",62.4,1.2],
-["XBADE",63.6,1.2],
-["T",64.8,1.2],
-["ADQ",66,1.2],
-["CNWS",67.2,1.2],
-["NSE",68.4,1.2],
-["NST",69.6,1.2],
-["NSY",70.8,1.2],
-["NSW",72,1.2],
-["ZBADE",73.2,1.2],
-["D",74.4,1.2],
-["G",75.6,1.2],
-["VNADH",76.8,2.4],
-["GQ",79.2,1.2],
-["W",80.4,1.2],
-["N",81.6,1.2],
-["BJ",82.8,1.2],
-["MSG",84,1.2],
-["F",85.2,1.2],
-["NAD",86.4,1.2],
-["G",87.6,1.2],
-["GJ",88.8,1.2],
-["Q",90,1.2],
-["N",91.2,1.2],
-["Z",92.4,1.2],
-["ADGQ",93.6,1.2],
-["J",94.8,1.2],
-["VAH",96,2.4],
-["GQ",98.4,2.4],
-["NJ",100.8,1.2],
-["BG",102,1.2],
-["MS",103.2,1.2],
-["G",104.4,1.2],
-["CNAD",105.6,1.2],
-["S",106.8,1.2],
-["BS",108,1.2],
-["S",109.2,1.2],
-["NS",110.4,1.2],
-["ZS",111.6,1.2],
-["ZCBSD",112.8,1.2],
-["SG",114,1.2],
-["VADH",115.2,2.4],
-["GQ",117.6,1.2],
-["W",118.8,1.2],
-["N",120,1.2],
-["BJ",121.2,1.2],
-["MSG",122.4,1.2],
-["F",123.6,1.2],
-["NAD",124.8,1.2],
-["G",126,1.2],
-["GJ",127.2,1.2],
-["Q",128.4,1.2],
-["N",129.6,1.2],
-["Z",130.8,1.2],
-["ADGQ",132,1.2],
-["J",133.2,1.2],
-["VAH",134.4,2.4],
-["GQ",136.8,2.4],
-["NJ",139.2,1.2],
-["BG",140.4,1.2],
-["MSG",141.6,1.2],
-["H",142.8,1.2],
-["CNAD",144,1.2],
-["S",145.2,1.2],
-["BS",146.4,1.2],
-["S",147.6,1.2],
-["NS",148.8,1.2],
-["ZS",150,1.2],
-["ZCBSH",151.2,1.2],
-["SJ",152.4,1.2],
-["ZVADQ",153.6,1.8],
-["ADG",155.4,1.2],
-["VNA",156.6,0.6],
-["AGJ",157.2,1.2],
-["H",158.4,1.2],
-["XBGJ",159.6,1.2],
-["ADGQ",160.8,1.2],
-["XB",162,1.2],
-["CND",163.2,1.2],
-["GJ",164.4,0.6],
-["AD",165,0.6],
-["H",165.6,0.6],
-["N",166.2,0.6],
-["ADGJ",166.8,1.2],
-["HQ",168,1.2],
-["AGJ",169.2,1.2],
-["ADG",170.4,1.2],
-["AH",171.6,1.2],
-["VADG",172.8,1.2],
-["ZA",174,0.6],
-["CB",174.6,0.6],
-["A",175.2,0.6],
-["V",175.8,0.6],
-["ZCBH",176.4,1.2],
-["DG",177.6,1.2],
-["BA",178.8,1.2],
-["NS",180,1.2],
-["BAD",181.2,1.2],
-["CN",182.4,1.2],
-["S",183.6,0.6],
-["ZCB",184.2,0.6],
-["S",184.8,0.6],
-["N",185.4,0.6],
-["ZS",186,1.2],
-["S",187.2,1.2],
-["AS",188.4,1.2],
-["ASH",189.6,1.2],
-["ZSJ",190.8,1.2],
-["VADQ",192,1.2],
-["AD",193.2,1.2],
-["AD",194.4,1.2],
-["ADJ",195.6,1.2],
-["ADH",196.8,0.6],
-["XB",197.4,0.6],
-["ADJ",198,1.2],
-["BDQ",199.2,1.2],
-["D",200.4,1.2],
-["CNS",201.6,1.2],
-["NSJ",202.8,1.2],
-["NSH",204,1.2],
-["NASGJ",205.2,1.2],
-["NSQ",206.4,0.6],
-["BAD",207,0.6],
-["SFW",207.6,1.2],
-["DGE",208.8,1.2],
-["RHF",210,1.2],
-["ZVNA",211.2,1.2],
-["AQ",212.4,1.2],
-["BAQ",213.6,1.2],
-["DE",214.8,1.2],
-["NSW",216,1.2],
-["AQ",217.2,1.2],
-["ADQ",218.4,2.4],
-["ZCA",220.8,7.2],
-["DE",228,1.2],
-["GT",229.2,0.6],
-["ED",229.8,0.6],
-["ZVAW",230.4,1.2],
-["VQ",231.6,0.6],
-["N",232.2,0.6],
-["ADH",232.8,0.6],
-["Q",233.4,1.2],
-["ADW",234.6,1.2],
-["B",235.8,0.6],
-["MSG",236.4,1.2],
-["BDE",237.6,0.6],
-["MSG",238.2,0.6],
-["T",238.8,0.6],
-["E",239.4,0.6],
-["CNDHW",240,1.2],
-["Q",241.2,0.6],
-["N",241.8,0.6],
-["ADG",242.4,0.6],
-["Q",243,1.2],
-["ADQ",244.2,1.2],
-["ZC",245.4,0.6],
-["ADG",246,1.2],
-["E",247.2,0.6],
-["ADG",247.8,0.6],
-["T",248.4,0.6],
-["E",249,0.6],
-["ZVAFW",249.6,1.2],
-["V",250.8,0.6],
-["N",251.4,0.6],
-["ADE",252,0.6],
-["GT",252.6,1.2],
-["ADGT",253.8,1.2],
-["BHY",255,0.6],
-["MSG",255.6,1.2],
-["MSGT",256.8,0.6],
-["R",257.4,0.6],
-["E",258,1.2],
-["CNDH",259.2,1.2],
-["W",260.4,0.6],
-["HE",261,0.6],
-["ADGT",261.6,0.6],
-["Y",262.2,0.6],
-["E",262.8,0.6],
-["ADW",263.4,0.6],
-["E",264,1.2],
-["ZA",265.2,1.2],
-["ADGE",266.4,0.6],
-["ZA",267,0.6],
-["GT",267.6,0.6],
-["DE",268.2,0.6],
-["ZVAW",268.8,1.2],
-["VQ",270,0.6],
-["N",270.6,0.6],
-["ADH",271.2,0.6],
-["Q",271.8,1.2],
-["ADW",273,1.2],
-["B",274.2,0.6],
-["MSG",274.8,1.2],
-["BDE",276,0.6],
-["MSG",276.6,0.6],
-["T",277.2,0.6],
-["E",277.8,0.6],
-["CNDHW",278.4,1.2],
-["Q",279.6,0.6],
-["N",280.2,0.6],
-["ADG",280.8,0.6],
-["Q",281.4,1.2],
-["ADQ",282.6,1.2],
-["ZC",283.8,0.6],
-["ADG",284.4,1.2],
-["AQ",285.6,0.6],
-["ADGMJ",286.2,0.6],
-["NH",286.8,0.6],
-["MJ",287.4,0.6],
-["ZVAFH",288,1.2],
-["V",289.2,0.6],
-["N",289.8,0.6],
-["ADW",290.4,1.8],
-["AD",292.2,0.6],
-["J",292.8,0.6],
-["B",293.4,0.6],
-["H",294,1.2],
-["MSGJ",295.2,1.2],
-["MGJ",296.4,1.2],
-["V",297.6,1.2],
-["ZAQ",298.8,1.2],
-["BAG",300,1.2],
-["X",301.2,1.2],
-["NAD",302.4,1.2],
-["N",303.6,0.6],
-["AZ",304.2,0.6],
-["C",304.8,0.6],
-["B",305.4,0.6],
-["N",306,0.6],
-["A",306.6,0.6],
-["VADW",307.2,1.2],
-["E",308.4,1.2],
-["T",309.6,1.2],
-["Q",310.8,1.2],
-["W",312,1.2],
-["BSE",313.2,1.2],
-["T",314.4,1.2],
-["Q",315.6,1.2],
-["NDGW",316.8,1.2],
-["E",318,1.2],
-["T",319.2,1.2],
-["Y",320.4,1.2],
-["W",321.6,1.2],
-["ZBDE",322.8,1.2],
-["H",324,1.2],
-["Q",325.2,1.2],
-["VADW",326.4,1.2],
-["E",327.6,1.2],
-["T",328.8,1.2],
-["Q",330,1.2],
-["W",331.2,1.2],
-["BSE",332.4,1.2],
-["ADT",333.6,1.2],
-["ADQ",334.8,1.2],
-["NASW",336,1.2],
-["SE",337.2,1.2],
-["ST",338.4,1.2],
-["SQ",339.6,1.2],
-["SW",340.8,1.2],
-["SE",342,2.4],
-["Q",344.4,0.6],
-["W",345,0.6],
-["VNAE",345.6,1.2],
-["W",346.8,0.6],
-["Q",347.4,0.6],
-["NADQ",348,1.2],
-["H",349.2,0.6],
-["J",349.8,0.6],
-["Q",350.4,1.2],
-["XBMSJ",351.6,0.6],
-["H",352.2,0.6],
-["BG",352.8,1.2],
-["BD",354,0.6],
-["G",354.6,0.6],
-["CNADH",355.2,1.2],
-["J",356.4,0.6],
-["Q",357,0.6],
-["ADJ",357.6,0.6],
-["G",358.2,0.6],
-["G",358.8,0.6],
-["H",359.4,0.6],
-["G",360,1.2],
-["ZBA",361.2,1.2],
-["CD",362.4,0.6],
-["D",363,0.6],
-["ZG",363.6,0.6],
-["G",364.2,0.6],
-["VNAH",364.8,1.2],
-["J",366,0.6],
-["Q",366.6,0.6],
-["NADJ",367.2,1.2],
-["Q",368.4,0.6],
-["W",369,0.6],
-["E",369.6,1.2],
-["XBMSW",370.8,0.6],
-["Q",371.4,0.6],
-["MJ",372,1.2],
-["BG",373.2,0.6],
-["G",373.8,0.6],
-["NAD",374.4,1.2],
-["Q",375.6,0.6],
-["W",376.2,0.6],
-["ADE",376.8,1.2],
-["W",378,0.6],
-["DE",378.6,0.6],
-["T",379.2,0.6],
-["Y",379.8,0.6],
-["ZBE",380.4,1.2],
-["W",381.6,0.6],
-["AD",382.2,1.2],
-["ZQ",383.4,0.6],
-["W",384,0.6],
-["ZVNAE",384.6,1.2],
-["W",385.8,0.6],
-["Q",386.4,0.6],
-["NADQ",387,1.2],
-["H",388.2,0.6],
-["J",388.8,0.6],
-["Q",389.4,1.2],
-["XBMSJ",390.6,0.6],
-["H",391.2,0.6],
-["BG",391.8,1.2],
-["BD",393,0.6],
-["G",393.6,0.6],
-["CNADH",394.2,1.2],
-["J",395.4,0.6],
-["Q",396,0.6],
-["ADJ",396.6,0.6],
-["G",397.2,0.6],
-["G",397.8,0.6],
-["H",398.4,0.6],
-["G",399,1.2],
-["ZBA",400.2,1.2],
-["NH",401.4,1.2],
-["Z",402.6,0.6],
-["G",403.2,0.6],
-["ZVNA",403.8,1.2],
-["FH",405,1.2],
-["NAD",406.2,0.6],
-["HQ",406.8,1.8],
-["W",408.6,1.2],
-["BMS",409.8,0.6],
-["QE",410.4,0.6],
-["XBMS",411,1.2],
-["BJW",412.2,1.2],
-["CNAD",413.4,0.6],
-["HQ",414,1.8],
-["CNA",415.8,1.2],
-["N",417,1.2],
-["A",418.2,0.6],
-["S",418.8,0.6],
-["DA",419.4,0.6],
-["B",420,0.6],
-["AG",420.6,0.6],
-["S",421.2,0.6],
-["CD",421.8,1.2],
-["VAFHQEY",423,1.2],
-["V",424.2,0.6],
-["A",424.8,0.6],
-["FHT",425.4,1.2],
-["R",426.6,0.6],
-["FH",427.2,0.6],
-["DE",427.8,1.2],
-["B",429,1.2],
-["MSGW",430.2,0.6],
-["DE",430.8,0.6],
-["BFR",431.4,1.2],
-["NDH",432.6,0.6],
-["ED",433.2,0.6],
-["NSW",433.8,0.6],
-["AQ",434.4,0.6],
-["DG",435,0.6],
-["SW",435.6,0.6],
-["ED",436.2,0.6],
-["DGE",436.8,1.2],
-["DE",438,0.6],
-["ZSW",438.6,0.6],
-["AQ",439.2,0.6],
-["ZCB",439.8,0.6],
-["NH",440.4,0.6],
-["ZMJ",441,0.6],
-["AQ",441.6,0.6],
-["VAF",442.2,0.6],
-["MJ",442.8,0.6],
-["VNH",443.4,0.6],
-["BAG",444,0.6],
-["VN",444.6,1.2],
-["G",445.8,0.6],
-["VN",446.4,0.6],
-["FH",447,1.2],
-["B",448.2,0.6],
-["HQ",448.8,0.6],
-["MSG",449.4,1.2],
-["BGJ",450.6,1.2],
-["CND",451.8,0.6],
-["DG",452.4,0.6],
-["N",453,0.6],
-["A",453.6,0.6],
-["CBAD",454.2,1.8],
-["CBDH",456,0.6],
-["N",456.6,0.6],
-["A",457.2,0.6],
-["ZS",457.8,0.6],
-["D",458.4,0.6],
-["CBG",459,0.6],
-["H",459.6,0.6],
-["Q",460.2,0.6],
-["W",460.8,0.6],
-["VAFHQEY",461.4,1.2],
-["V",462.6,0.6],
-["A",463.2,0.6],
-["FHT",463.8,1.2],
-["R",465,0.6],
-["FH",465.6,0.6],
-["DE",466.2,1.2],
-["B",467.4,1.2],
-["MSGW",468.6,0.6],
-["DE",469.2,0.6],
-["BFR",469.8,1.2],
-["DH",471,1.2],
-["AD",472.2,1.2],
-["ADQE",473.4,0.6],
-["JW",474,0.6],
-["ADQE",474.6,1.2],
-["AD",475.8,1.2],
-["AD",477,1.2],
-["ZBMS",478.2,1.2],
-["MS",479.4,1.2],
-["VAD",480.6,1.2],
-["AD",481.8,1.2],
-["AD",483,1.2],
-["ADWR",484.2,1.2],
-["ADQE",485.4,1.2],
-["ADJW",486.6,1.2],
-["BSGQ",487.8,1.2],
-["AQ",489,1.2],
-["VAD",490.2,1.2],
-["V",491.4,0.6],
-["N",492,0.6],
-["AD",492.6,1.2],
-["V",493.8,0.6],
-["NAD",494.4,1.2],
-["V",495.6,0.6],
-["NAD",496.2,1.2],
-["V",497.4,1.2],
-["DA",498.6,1.2],
-["VNASD",499.8,1.2],
-["V",501,0.6],
-["N",501.6,0.6],
-["AD",502.2,1.2],
-["V",503.4,0.6],
-["NAD",504,1.2],
-["V",505.2,0.6],
-["NAD",505.8,1.2],
-["V",507,1.2],
-["DA",508.2,1.2],
-["BASG",509.4,1.2],
-["GB",510.6,0.6],
-["AG",511.2,0.6],
-["SG",511.8,0.6],
-["G",512.4,0.6],
-["BG",513,0.6],
-["SG",513.6,0.6],
-["H",514.2,0.6],
-["H",514.8,0.6],
-["BH",515.4,0.6],
-["H",516,0.6],
-["SGQ",516.6,0.6],
-["Q",517.2,0.6],
-["BAQ",517.8,0.6],
-["AQ",518.4,0.6],
-["BSGW",519,0.6],
-["WS",519.6,0.6],
-["BSW",520.2,0.6],
-["SW",520.8,0.6],
-["BDGE",521.4,0.6],
-["DE",522,0.6],
-["BDE",522.6,0.6],
-["DE",523.2,0.6],
-["BGT",523.8,0.6],
-["GT",524.4,0.6],
-["BGT",525,0.6],
-["GT",525.6,0.6],
-["DE",526.2,1.2],
-["GT",527.4,0.6],
-["ED",528,0.6],
-["ZVAW",528.6,1.2],
-["VQ",529.8,0.6],
-["N",530.4,0.6],
-["ADH",531,0.6],
-["Q",531.6,1.2],
-["ADW",532.8,1.2],
-["B",534,0.6],
-["MSG",534.6,1.2],
-["BDE",535.8,0.6],
-["MSG",536.4,0.6],
-["T",537,0.6],
-["E",537.6,0.6],
-["CNDHW",538.2,1.2],
-["Q",539.4,0.6],
-["N",540,0.6],
-["ADG",540.6,0.6],
-["Q",541.2,1.2],
-["ADQ",542.4,1.2],
-["ZC",543.6,0.6],
-["ADG",544.2,1.2],
-["E",545.4,0.6],
-["ADG",546,0.6],
-["T",546.6,0.6],
-["E",547.2,0.6],
-["ZVAFW",547.8,1.2],
-["V",549,0.6],
-["N",549.6,0.6],
-["ADE",550.2,0.6],
-["GT",550.8,1.2],
-["ADGT",552,1.2],
-["BHY",553.2,0.6],
-["MSG",553.8,1.2],
-["MSGT",555,0.6],
-["R",555.6,0.6],
-["E",556.2,1.2],
-["CNDH",557.4,1.2],
-["W",558.6,0.6],
-["HE",559.2,0.6],
-["ADGT",559.8,0.6],
-["Y",560.4,0.6],
-["E",561,0.6],
-["ADW",561.6,0.6],
-["E",562.2,1.2],
-["ZA",563.4,1.2],
-["ADGE",564.6,0.6],
-["ZA",565.2,0.6],
-["GT",565.8,0.6],
-["DE",566.4,0.6],
-["ZVAW",567,1.2],
-["VQ",568.2,0.6],
-["N",568.8,0.6],
-["ADH",569.4,0.6],
-["Q",570,1.2],
-["ADW",571.2,1.2],
-["B",572.4,0.6],
-["MSG",573,1.2],
-["BDE",574.2,0.6],
-["MSG",574.8,0.6],
-["T",575.4,0.6],
-["E",576,0.6],
-["CNDHW",576.6,1.2],
-["Q",577.8,0.6],
-["N",578.4,0.6],
-["ADG",579,0.6],
-["Q",579.6,1.2],
-["ADQ",580.8,1.2],
-["ZC",582,0.6],
-["ADG",582.6,1.2],
-["AQ",583.8,0.6],
-["ADGMJ",584.4,0.6],
-["NH",585,0.6],
-["MJ",585.6,0.6],
-["ZVAFH",586.2,1.2],
-["V",587.4,0.6],
-["N",588,0.6],
-["ADW",588.6,1.8],
-["AD",590.4,0.6],
-["J",591,0.6],
-["B",591.6,0.6],
-["H",592.2,1.2],
-["MSGJ",593.4,1.2],
-["MGJ",594.6,1.2],
-["V",595.8,1.2],
-["AQ",597,0.6],
-["Z",597.6,0.6],
-["BADHQ",598.2,1.2],
-["X",599.4,1.2],
-["NADH",600.6,1.2],
-["N",601.8,0.6],
-["N",602.4,0.6],
-["BADG",603,0.6],
-["H",603.6,0.6],
-["D",604.2,0.6],
-["N",604.8,0.6],
-["ZVAF",605.4,1.2],
-["T",606.6,1.2],
-["GQE",607.8,0.6],
-["W",608.4,0.6],
-["Q",609,0.6],
-["W",609.6,0.6],
-["W",610.2,1.2],
-["ZVAG",611.4,1.2],
-["D",612.6,0.6],
-["VS",613.2,0.6],
-["A",613.8,0.6],
-["S",614.4,0.6],
-["ZVAF",615,1.2],
-["T",616.2,1.2],
-["GQE",617.4,0.6],
-["W",618,0.6],
-["Q",618.6,0.6],
-["W",619.2,0.6],
-["W",619.8,1.2],
-["ZVAG",621,1.2],
-["D",622.2,0.6],
-["VS",622.8,0.6],
-["A",623.4,0.6],
-["S",624,0.6],
-["XBSG",624.6,1.2],
-["T",625.8,1.2],
-["GJE",627,0.6],
-["W",627.6,0.6],
-["Q",628.2,0.6],
-["W",628.8,0.6],
-["W",629.4,1.2],
-["BMG",630.6,1.2],
-["D",631.8,0.6],
-["BS",632.4,0.6],
-["A",633,0.6],
-["S",633.6,0.6],
-["XBS",634.2,1.2],
-["Y",635.4,1.2],
-["JET",636.6,0.6],
-["E",637.2,0.6],
-["E",637.8,0.6],
-["T",638.4,0.6],
-["T",639,1.2],
-["BMH",640.2,1.2],
-["G",641.4,0.6],
-["BD",642,0.6],
-["BD",642.6,0.6],
-["G",643.2,0.6],
-["CNDG",643.8,1.2],
-["T",645,1.2],
-["HQE",646.2,0.6],
-["Q",646.8,0.6],
-["Q",647.4,0.6],
-["ADHW",648,0.6],
-["W",648.6,1.2],
-["CNAG",649.8,1.2],
-["D",651,0.6],
-["CNS",651.6,0.6],
-["A",652.2,0.6],
-["NS",652.8,0.6],
-["CNAS",653.4,1.2],
-["T",654.6,1.2],
-["HQE",655.8,0.6],
-["Q",656.4,0.6],
-["Q",657,0.6],
-["ADHW",657.6,0.6],
-["W",658.2,1.2],
-["CNAG",659.4,1.2],
-["D",660.6,0.6],
-["CNA",661.2,0.6],
-["A",661.8,0.6],
-["NS",662.4,0.6],
-["BMGJ",663,1.2],
-["T",664.2,1.2],
-["GJE",665.4,0.6],
-["Q",666,0.6],
-["Q",666.6,0.6],
-["W",667.2,0.6],
-["W",667.8,1.2],
-["BMSJ",669,0.6],
-["XSW",669.6,0.6],
-["ED",670.2,1.2],
-["RF",671.4,1.2],
-["XBSG",672.6,1.2],
-["SGJT",673.8,1.2],
-["BSGJT",675,1.2],
-["BSGJT",676.2,1.2],
-["BSGJT",677.4,4.8],
-["VAW",682.2,1.2],
-["E",683.4,1.2],
-["T",684.6,1.2],
-["Q",685.8,1.2],
-["W",687,1.2],
-["BSE",688.2,1.2],
-["T",689.4,1.2],
-["Q",690.6,1.2],
-["NDW",691.8,1.2],
-["E",693,1.2],
-["T",694.2,1.2],
-["Y",695.4,1.2],
-["W",696.6,1.2],
-["BSE",697.8,1.2],
-["H",699,1.2],
-["Q",700.2,1.2],
-["VAW",701.4,1.2],
-["E",702.6,1.2],
-["T",703.8,1.2],
-["Q",705,1.2],
-["W",706.2,1.2],
-["BSE",707.4,1.2],
-["T",708.6,1.2],
-["Q",709.8,1.2],
-["NDW",711,1.2],
-["E",712.2,1.2],
-["T",713.4,1.2],
-["Q",714.6,1.2],
-["W",715.8,1.4],
-["E",717.2,1.6],
-["Q",718.8,2.4],
-["W",721.2,0.6]
+            ["VAW",0.0,0.3],
+            ["E",0.3,0.3],
+            ["T",0.6,0.3],
+            ["Q",0.9,0.3],
+            ["W",1.2,0.3],
+            ["BSE",1.5,0.3],
+            ["T",1.8,0.3],
+            ["Q",2.1,0.3],
+            ["NDW",2.4,0.3],
+            ["E",2.7,0.3],
+            ["T",3.0,0.3],
+            ["Y",3.3,0.3],
+            ["W",3.6,0.3],
+            ["BSE",3.9,0.3],
+            ["H",4.2,0.3],
+            ["Q",4.5,0.3],
+            ["VAW",4.8,0.3],
+            ["E",5.1,0.3],
+            ["T",5.4,0.3],
+            ["Q",5.7,0.3],
+            ["W",6.0,0.3],
+            ["BSE",6.3,0.3],
+            ["T",6.6,0.3],
+            ["Q",6.9,0.3],
+            ["CNDGW",7.2,0.3],
+            ["E",7.5,0.3],
+            ["T",7.8,0.3],
+            ["Y",8.1,0.3],
+            ["W",8.4,0.3],
+            ["ZBDE",8.7,0.3],
+            ["H",9.0,0.3],
+            ["Q",9.3,0.3],
+            ["ZVADW",9.6,0.3],
+            ["ADE",9.9,0.3],
+            ["ADT",10.2,0.3],
+            ["ADQ",10.5,0.3],
+            ["ADW",10.8,0.3],
+            ["XBADE",11.1,0.3],
+            ["T",11.4,0.3],
+            ["ADQ",11.7,0.3],
+            ["CNWS",12.0,0.3],
+            ["NSE",12.3,0.3],
+            ["NST",12.6,0.3],
+            ["NSY",12.9,0.3],
+            ["NSW",13.2,0.3],
+            ["ZBSE",13.5,0.3],
+            ["NSH",13.8,0.3],
+            ["NSQ",14.1,0.3],
+            ["ZVADW",14.4,0.3],
+            ["ADE",14.7,0.3],
+            ["ADT",15.0,0.3],
+            ["ADQ",15.3,0.3],
+            ["ADW",15.6,0.3],
+            ["XBADE",15.9,0.3],
+            ["T",16.2,0.3],
+            ["ADQ",16.5,0.3],
+            ["CNWS",16.8,0.3],
+            ["NSE",17.1,0.3],
+            ["NST",17.4,0.3],
+            ["NSY",17.7,0.3],
+            ["NSW",18.0,0.3],
+            ["ZBADE",18.3,0.3],
+            ["D",18.6,0.3],
+            ["G",18.9,0.3],
+            ["VNADH",19.2,0.6],
+            ["GQ",19.8,0.3],
+            ["W",20.1,0.3],
+            ["N",20.4,0.3],
+            ["BJ",20.7,0.3],
+            ["MSG",21.0,0.3],
+            ["F",21.3,0.3],
+            ["NAD",21.6,0.3],
+            ["G",21.9,0.3],
+            ["GJ",22.2,0.3],
+            ["Q",22.5,0.3],
+            ["N",22.8,0.3],
+            ["Z",23.1,0.3],
+            ["ADGQ",23.4,0.3],
+            ["J",23.7,0.3],
+            ["VAH",24.0,0.6],
+            ["GQ",24.6,0.6],
+            ["NJ",25.2,0.3],
+            ["BG",25.5,0.3],
+            ["MS",25.8,0.3],
+            ["G",26.1,0.3],
+            ["CNAD",26.4,0.3],
+            ["S",26.7,0.3],
+            ["BS",27.0,0.3],
+            ["S",27.3,0.3],
+            ["NS",27.6,0.3],
+            ["ZS",27.9,0.3],
+            ["ZCBSD",28.2,0.3],
+            ["SG",28.5,0.3],
+            ["VADH",28.8,0.6],
+            ["GQ",29.4,0.3],
+            ["W",29.7,0.3],
+            ["N",30.0,0.3],
+            ["BJ",30.3,0.3],
+            ["MSG",30.6,0.3],
+            ["F",30.9,0.3],
+            ["NAD",31.2,0.3],
+            ["G",31.5,0.3],
+            ["GJ",31.8,0.3],
+            ["Q",32.1,0.3],
+            ["N",32.4,0.3],
+            ["Z",32.7,0.3],
+            ["ADGQ",33.0,0.3],
+            ["J",33.3,0.3],
+            ["VAH",33.6,0.6],
+            ["GQ",34.2,0.6],
+            ["NJ",34.8,0.3],
+            ["BG",35.1,0.3],
+            ["MSG",35.4,0.3],
+            ["H",35.7,0.3],
+            ["CNAD",36.0,0.3],
+            ["S",36.3,0.3],
+            ["BS",36.6,0.3],
+            ["S",36.9,0.3],
+            ["NS",37.2,0.3],
+            ["ZS",37.5,0.3],
+            ["ZCBSH",37.8,0.3],
+            ["SJ",38.1,0.3],
+            ["ZVADQ",38.4,0.45],
+            ["ADG",38.85,0.3],
+            ["VNA",39.15,0.15],
+            ["AGJ",39.3,0.3],
+            ["H",39.6,0.3],
+            ["XBGJ",39.9,0.3],
+            ["ADGQ",40.2,0.3],
+            ["XB",40.5,0.3],
+            ["CND",40.8,0.3],
+            ["GJ",41.1,0.15],
+            ["AD",41.25,0.15],
+            ["H",41.4,0.15],
+            ["N",41.55,0.15],
+            ["ADGJ",41.7,0.3],
+            ["HQ",42.0,0.3],
+            ["AGJ",42.3,0.3],
+            ["ADG",42.6,0.3],
+            ["AH",42.9,0.3],
+            ["VADG",43.2,0.3],
+            ["ZA",43.5,0.15],
+            ["CB",43.65,0.15],
+            ["A",43.8,0.15],
+            ["V",43.95,0.15],
+            ["ZCBH",44.1,0.3],
+            ["DG",44.4,0.3],
+            ["BA",44.7,0.3],
+            ["NS",45.0,0.3],
+            ["BAD",45.3,0.3],
+            ["CN",45.6,0.3],
+            ["S",45.9,0.15],
+            ["ZCB",46.05,0.15],
+            ["S",46.2,0.15],
+            ["N",46.35,0.15],
+            ["ZS",46.5,0.3],
+            ["S",46.8,0.3],
+            ["AS",47.1,0.3],
+            ["ASH",47.4,0.3],
+            ["ZSJ",47.7,0.3],
+            ["VADQ",48.0,0.3],
+            ["AD",48.3,0.3],
+            ["AD",48.6,0.3],
+            ["ADJ",48.9,0.3],
+            ["ADH",49.2,0.15],
+            ["XB",49.35,0.15],
+            ["ADJ",49.5,0.3],
+            ["BDQ",49.8,0.3],
+            ["D",50.1,0.3],
+            ["CNS",50.4,0.3],
+            ["NSJ",50.7,0.3],
+            ["NSH",51.0,0.3],
+            ["NASGJ",51.3,0.3],
+            ["NSQ",51.6,0.15],
+            ["BAD",51.75,0.15],
+            ["SFW",51.9,0.3],
+            ["DGE",52.2,0.3],
+            ["RHF",52.5,0.3],
+            ["ZVNA",52.8,0.3],
+            ["AQ",53.1,0.3],
+            ["BAQ",53.4,0.3],
+            ["DE",53.7,0.3],
+            ["NSW",54.0,0.3],
+            ["AQ",54.3,0.3],
+            ["ADQ",54.6,0.6],
+            ["ZCA",55.2,1.8],
+            ["DE",57.0,0.3],
+            ["GT",57.3,0.15],
+            ["ED",57.45,0.15],
+            ["ZVAW",57.6,0.3],
+            ["VQ",57.9,0.15],
+            ["N",58.05,0.15],
+            ["ADH",58.2,0.15],
+            ["Q",58.35,0.3],
+            ["ADW",58.65,0.3],
+            ["B",58.95,0.15],
+            ["MSG",59.1,0.3],
+            ["BDE",59.4,0.15],
+            ["MSG",59.55,0.15],
+            ["T",59.7,0.15],
+            ["E",59.85,0.15],
+            ["CNDHW",60.0,0.3],
+            ["Q",60.3,0.15],
+            ["N",60.45,0.15],
+            ["ADG",60.6,0.15],
+            ["Q",60.75,0.3],
+            ["ADQ",61.05,0.3],
+            ["ZC",61.35,0.15],
+            ["ADG",61.5,0.3],
+            ["E",61.8,0.15],
+            ["ADG",61.95,0.15],
+            ["T",62.1,0.15],
+            ["E",62.25,0.15],
+            ["ZVAFW",62.4,0.3],
+            ["V",62.7,0.15],
+            ["N",62.85,0.15],
+            ["ADE",63.0,0.15],
+            ["GT",63.15,0.3],
+            ["ADGT",63.45,0.3],
+            ["BHY",63.75,0.15],
+            ["MSG",63.9,0.3],
+            ["MSGT",64.2,0.15],
+            ["R",64.35,0.15],
+            ["E",64.5,0.3],
+            ["CNDH",64.8,0.3],
+            ["W",65.1,0.15],
+            ["HE",65.25,0.15],
+            ["ADGT",65.4,0.15],
+            ["Y",65.55,0.15],
+            ["E",65.7,0.15],
+            ["ADW",65.85,0.15],
+            ["E",66.0,0.3],
+            ["ZA",66.3,0.3],
+            ["ADGE",66.6,0.15],
+            ["ZA",66.75,0.15],
+            ["GT",66.9,0.15],
+            ["DE",67.05,0.15],
+            ["ZVAW",67.2,0.3],
+            ["VQ",67.5,0.15],
+            ["N",67.65,0.15],
+            ["ADH",67.8,0.15],
+            ["Q",67.95,0.3],
+            ["ADW",68.25,0.3],
+            ["B",68.55,0.15],
+            ["MSG",68.7,0.3],
+            ["BDE",69.0,0.15],
+            ["MSG",69.15,0.15],
+            ["T",69.3,0.15],
+            ["E",69.45,0.15],
+            ["CNDHW",69.6,0.3],
+            ["Q",69.9,0.15],
+            ["N",70.05,0.15],
+            ["ADG",70.2,0.15],
+            ["Q",70.35,0.3],
+            ["ADQ",70.65,0.3],
+            ["ZC",70.95,0.15],
+            ["ADG",71.1,0.3],
+            ["AQ",71.4,0.15],
+            ["ADGMJ",71.55,0.15],
+            ["NH",71.7,0.15],
+            ["MJ",71.85,0.15],
+            ["ZVAFH",72.0,0.3],
+            ["V",72.3,0.15],
+            ["N",72.45,0.15],
+            ["ADW",72.6,0.45],
+            ["AD",73.05,0.15],
+            ["J",73.2,0.15],
+            ["B",73.35,0.15],
+            ["H",73.5,0.3],
+            ["MSGJ",73.8,0.3],
+            ["MGJ",74.1,0.3],
+            ["V",74.4,0.3],
+            ["ZAQ",74.7,0.3],
+            ["BAG",75.0,0.3],
+            ["X",75.3,0.3],
+            ["NAD",75.6,0.3],
+            ["N",75.9,0.15],
+            ["AZ",76.05,0.15],
+            ["C",76.2,0.15],
+            ["B",76.35,0.15],
+            ["N",76.5,0.15],
+            ["A",76.65,0.15],
+            ["VADW",76.8,0.3],
+            ["E",77.1,0.3],
+            ["T",77.4,0.3],
+            ["Q",77.7,0.3],
+            ["W",78.0,0.3],
+            ["BSE",78.3,0.3],
+            ["T",78.6,0.3],
+            ["Q",78.9,0.3],
+            ["NDGW",79.2,0.3],
+            ["E",79.5,0.3],
+            ["T",79.8,0.3],
+            ["Y",80.1,0.3],
+            ["W",80.4,0.3],
+            ["ZBDE",80.7,0.3],
+            ["H",81.0,0.3],
+            ["Q",81.3,0.3],
+            ["VADW",81.6,0.3],
+            ["E",81.9,0.3],
+            ["T",82.2,0.3],
+            ["Q",82.5,0.3],
+            ["W",82.8,0.3],
+            ["BSE",83.1,0.3],
+            ["ADT",83.4,0.3],
+            ["ADQ",83.7,0.3],
+            ["NASW",84.0,0.3],
+            ["SE",84.3,0.3],
+            ["ST",84.6,0.3],
+            ["SQ",84.9,0.3],
+            ["SW",85.2,0.3],
+            ["SE",85.5,0.6],
+            ["Q",86.1,0.15],
+            ["W",86.25,0.15],
+            ["VNAE",86.4,0.3],
+            ["W",86.7,0.15],
+            ["Q",86.85,0.15],
+            ["NADQ",87.0,0.3],
+            ["H",87.3,0.15],
+            ["J",87.45,0.15],
+            ["Q",87.6,0.3],
+            ["XBMSJ",87.9,0.15],
+            ["H",88.05,0.15],
+            ["BG",88.2,0.3],
+            ["BD",88.5,0.15],
+            ["G",88.65,0.15],
+            ["CNADH",88.8,0.3],
+            ["J",89.1,0.15],
+            ["Q",89.25,0.15],
+            ["ADJ",89.4,0.15],
+            ["G",89.55,0.15],
+            ["G",89.7,0.15],
+            ["H",89.85,0.15],
+            ["G",90.0,0.3],
+            ["ZBA",90.3,0.3],
+            ["CD",90.6,0.15],
+            ["D",90.75,0.15],
+            ["ZG",90.9,0.15],
+            ["G",91.05,0.15],
+            ["VNAH",91.2,0.3],
+            ["J",91.5,0.15],
+            ["Q",91.65,0.15],
+            ["NADJ",91.8,0.3],
+            ["Q",92.1,0.15],
+            ["W",92.25,0.15],
+            ["E",92.4,0.3],
+            ["XBMSW",92.7,0.15],
+            ["Q",92.85,0.15],
+            ["MJ",93.0,0.3],
+            ["BG",93.3,0.15],
+            ["G",93.45,0.15],
+            ["NAD",93.6,0.3],
+            ["Q",93.9,0.15],
+            ["W",94.05,0.15],
+            ["ADE",94.2,0.3],
+            ["W",94.5,0.15],
+            ["DE",94.65,0.15],
+            ["T",94.8,0.15],
+            ["Y",94.95,0.15],
+            ["ZBE",95.1,0.15],
+            ["W",95.25,0.15],
+            ["AD",95.4,0.3],
+            ["ZQ",95.7,0.15],
+            ["W",95.85,0.15],
+            ["ZVNAE",96.0,0.3],
+            ["W",96.3,0.15],
+            ["Q",96.45,0.15],
+            ["NADQ",96.6,0.3],
+            ["H",96.9,0.15],
+            ["J",97.05,0.15],
+            ["Q",97.2,0.3],
+            ["XBMSJ",97.5,0.15],
+            ["H",97.65,0.15],
+            ["BG",97.8,0.3],
+            ["BD",98.1,0.15],
+            ["G",98.25,0.15],
+            ["CNADH",98.4,0.3],
+            ["J",98.7,0.15],
+            ["Q",98.85,0.15],
+            ["ADJ",99.0,0.15],
+            ["G",99.15,0.15],
+            ["G",99.3,0.15],
+            ["H",99.45,0.15],
+            ["G",99.6,0.3],
+            ["ZBA",99.9,0.3],
+            ["NH",100.2,0.3],
+            ["Z",100.5,0.15],
+            ["G",100.65,0.15],
+            ["ZVNA",100.8,0.3],
+            ["FH",101.1,0.3],
+            ["NAD",101.4,0.15],
+            ["HQ",101.55,0.45],
+            ["W",102.0,0.3],
+            ["BMS",102.3,0.15],
+            ["QE",102.45,0.15],
+            ["XBMS",102.6,0.3],
+            ["BJW",102.9,0.3],
+            ["CNAD",103.2,0.15],
+            ["HQ",103.35,0.45],
+            ["CNA",103.8,0.3],
+            ["N",104.1,0.3],
+            ["A",104.4,0.15],
+            ["S",104.55,0.15],
+            ["DA",104.7,0.15],
+            ["B",104.85,0.15],
+            ["AG",105.0,0.15],
+            ["S",105.15,0.15],
+            ["CD",105.3,0.3],
+            ["VAFHQEY",105.6,0.3],
+            ["V",105.9,0.15],
+            ["A",106.05,0.15],
+            ["FHT",106.2,0.3],
+            ["R",106.5,0.15],
+            ["FH",106.65,0.15],
+            ["DE",106.8,0.3],
+            ["B",107.1,0.3],
+            ["MSGW",107.4,0.15],
+            ["DE",107.55,0.15],
+            ["BFR",107.7,0.3],
+            ["NDH",108.0,0.15],
+            ["ED",108.15,0.15],
+            ["NSW",108.3,0.15],
+            ["AQ",108.45,0.15],
+            ["DG",108.6,0.15],
+            ["SW",108.75,0.15],
+            ["ED",108.9,0.15],
+            ["DGE",109.05,0.3],
+            ["DE",109.35,0.15],
+            ["ZSW",109.5,0.15],
+            ["AQ",109.65,0.15],
+            ["ZCB",109.8,0.15],
+            ["NH",109.95,0.15],
+            ["ZMJ",110.1,0.15],
+            ["AQ",110.25,0.15],
+            ["VAF",110.4,0.15],
+            ["MJ",110.55,0.15],
+            ["VNH",110.7,0.15],
+            ["BAG",110.85,0.15],
+            ["VN",111.0,0.3],
+            ["G",111.3,0.15],
+            ["VN",111.45,0.15],
+            ["FH",111.6,0.3],
+            ["B",111.9,0.15],
+            ["HQ",112.05,0.15],
+            ["MSG",112.2,0.3],
+            ["BGJ",112.5,0.3],
+            ["CND",112.8,0.15],
+            ["DG",112.95,0.15],
+            ["N",113.1,0.15],
+            ["A",113.25,0.15],
+            ["CBAD",113.4,0.45],
+            ["CBDH",113.85,0.15],
+            ["N",114.0,0.15],
+            ["A",114.15,0.15],
+            ["ZS",114.3,0.15],
+            ["D",114.45,0.15],
+            ["CBG",114.6,0.15],
+            ["H",114.75,0.15],
+            ["Q",114.9,0.15],
+            ["W",115.05,0.15],
+            ["VAFHQEY",115.2,0.3],
+            ["V",115.5,0.15],
+            ["A",115.65,0.15],
+            ["FHT",115.8,0.3],
+            ["R",116.1,0.15],
+            ["FH",116.25,0.15],
+            ["DE",116.4,0.3],
+            ["B",116.7,0.3],
+            ["MSGW",117.0,0.15],
+            ["DE",117.15,0.15],
+            ["BFR",117.3,0.3],
+            ["DH",117.6,0.3],
+            ["AD",117.9,0.3],
+            ["ADQE",118.2,0.15],
+            ["JW",118.35,0.15],
+            ["ADQE",118.5,0.3],
+            ["AD",118.8,0.3],
+            ["AD",119.1,0.3],
+            ["ZBMS",119.4,0.3],
+            ["MS",119.7,0.3],
+            ["VAD",120.0,0.3],
+            ["AD",120.3,0.3],
+            ["AD",120.6,0.3],
+            ["ADWR",120.9,0.3],
+            ["ADQE",121.2,0.3],
+            ["ADJW",121.5,0.3],
+            ["BSGQ",121.8,0.3],
+            ["AQ",122.1,0.3],
+            ["VAD",122.4,0.3],
+            ["V",122.7,0.15],
+            ["N",122.85,0.15],
+            ["AD",123.0,0.3],
+            ["V",123.3,0.15],
+            ["NAD",123.45,0.3],
+            ["V",123.75,0.15],
+            ["NAD",123.9,0.3],
+            ["V",124.2,0.3],
+            ["DA",124.5,0.3],
+            ["VNASD",124.8,0.3],
+            ["V",125.1,0.15],
+            ["N",125.25,0.15],
+            ["AD",125.4,0.3],
+            ["V",125.7,0.15],
+            ["NAD",125.85,0.3],
+            ["V",126.15,0.15],
+            ["NAD",126.3,0.3],
+            ["V",126.6,0.3],
+            ["DA",126.9,0.3],
+            ["BASG",127.2,0.3],
+            ["GB",127.5,0.15],
+            ["AG",127.65,0.15],
+            ["SG",127.8,0.15],
+            ["G",127.95,0.15],
+            ["BG",128.1,0.15],
+            ["SG",128.25,0.15],
+            ["H",128.4,0.15],
+            ["H",128.55,0.15],
+            ["BH",128.7,0.15],
+            ["H",128.85,0.15],
+            ["SGQ",129.0,0.15],
+            ["Q",129.15,0.15],
+            ["BAQ",129.3,0.15],
+            ["AQ",129.45,0.15],
+            ["BSGW",129.6,0.15],
+            ["WS",129.75,0.15],
+            ["BSW",129.9,0.15],
+            ["SW",130.05,0.15],
+            ["BDGE",130.2,0.15],
+            ["DE",130.35,0.15],
+            ["BDE",130.5,0.15],
+            ["DE",130.65,0.15],
+            ["BGT",130.8,0.15],
+            ["GT",130.95,0.15],
+            ["BGT",131.1,0.15],
+            ["GT",131.25,0.15],
+            ["DE",131.4,0.3],
+            ["GT",131.7,0.15],
+            ["ED",131.85,0.15],
+            ["ZVAW",132.0,0.3],
+            ["VQ",132.3,0.15],
+            ["N",132.45,0.15],
+            ["ADH",132.6,0.15],
+            ["Q",132.75,0.3],
+            ["ADW",133.05,0.3],
+            ["B",133.35,0.15],
+            ["MSG",133.5,0.3],
+            ["BDE",133.8,0.15],
+            ["MSG",133.95,0.15],
+            ["T",134.1,0.15],
+            ["E",134.25,0.15],
+            ["CNDHW",134.4,0.3],
+            ["Q",134.7,0.15],
+            ["N",134.85,0.15],
+            ["ADG",135.0,0.15],
+            ["Q",135.15,0.3],
+            ["ADQ",135.45,0.3],
+            ["ZC",135.75,0.15],
+            ["ADG",135.9,0.3],
+            ["E",136.2,0.15],
+            ["ADG",136.35,0.15],
+            ["T",136.5,0.15],
+            ["E",136.65,0.15],
+            ["ZVAFW",136.8,0.3],
+            ["V",137.1,0.15],
+            ["N",137.25,0.15],
+            ["ADE",137.4,0.15],
+            ["GT",137.55,0.3],
+            ["ADGT",137.85,0.3],
+            ["BHY",138.15,0.15],
+            ["MSG",138.3,0.3],
+            ["MSGT",138.6,0.15],
+            ["R",138.75,0.15],
+            ["E",138.9,0.3],
+            ["CNDH",139.2,0.3],
+            ["W",139.5,0.15],
+            ["HE",139.65,0.15],
+            ["ADGT",139.8,0.15],
+            ["Y",139.95,0.15],
+            ["E",140.1,0.15],
+            ["ADW",140.25,0.15],
+            ["E",140.4,0.3],
+            ["ZA",140.7,0.3],
+            ["ADGE",141.0,0.15],
+            ["ZA",141.15,0.15],
+            ["GT",141.3,0.15],
+            ["DE",141.45,0.15],
+            ["ZVAW",141.6,0.3],
+            ["VQ",141.9,0.15],
+            ["N",142.05,0.15],
+            ["ADH",142.2,0.15],
+            ["Q",142.35,0.3],
+            ["ADW",142.65,0.3],
+            ["B",142.95,0.15],
+            ["MSG",143.1,0.3],
+            ["BDE",143.4,0.15],
+            ["MSG",143.55,0.15],
+            ["T",143.7,0.15],
+            ["E",143.85,0.15],
+            ["CNDHW",144.0,0.3],
+            ["Q",144.3,0.15],
+            ["N",144.45,0.15],
+            ["ADG",144.6,0.15],
+            ["Q",144.75,0.3],
+            ["ADQ",145.05,0.3],
+            ["ZC",145.35,0.15],
+            ["ADG",145.5,0.3],
+            ["AQ",145.8,0.15],
+            ["ADGMJ",145.95,0.15],
+            ["NH",146.1,0.15],
+            ["MJ",146.25,0.15],
+            ["ZVAFH",146.4,0.3],
+            ["V",146.7,0.15],
+            ["N",146.85,0.15],
+            ["ADW",147.0,0.45],
+            ["AD",147.45,0.15],
+            ["J",147.6,0.15],
+            ["B",147.75,0.15],
+            ["H",147.9,0.3],
+            ["MSGJ",148.2,0.3],
+            ["MGJ",148.5,0.3],
+            ["V",148.8,0.3],
+            ["AQ",149.1,0.15],
+            ["Z",149.25,0.15],
+            ["BADHQ",149.4,0.3],
+            ["X",149.7,0.3],
+            ["NADH",150.0,0.3],
+            ["N",150.3,0.15],
+            ["N",150.45,0.15],
+            ["BADG",150.6,0.15],
+            ["H",150.75,0.15],
+            ["D",150.9,0.15],
+            ["N",151.05,0.15],
+            ["ZVAF",151.2,0.3],
+            ["T",151.5,0.3],
+            ["GQE",151.8,0.15],
+            ["W",151.95,0.15],
+            ["Q",152.1,0.15],
+            ["W",152.25,0.15],
+            ["W",152.4,0.3],
+            ["ZVAG",152.7,0.3],
+            ["D",153.0,0.15],
+            ["VS",153.15,0.15],
+            ["A",153.3,0.15],
+            ["S",153.45,0.15],
+            ["ZVAF",153.6,0.3],
+            ["T",153.9,0.3],
+            ["GQE",154.2,0.15],
+            ["W",154.35,0.15],
+            ["Q",154.5,0.15],
+            ["W",154.65,0.15],
+            ["W",154.8,0.3],
+            ["ZVAG",155.1,0.3],
+            ["D",155.4,0.15],
+            ["VS",155.55,0.15],
+            ["A",155.7,0.15],
+            ["S",155.85,0.15],
+            ["XBSG",156.0,0.3],
+            ["T",156.3,0.3],
+            ["GJE",156.6,0.15],
+            ["W",156.75,0.15],
+            ["Q",156.9,0.15],
+            ["W",157.05,0.15],
+            ["W",157.2,0.3],
+            ["BMG",157.5,0.3],
+            ["D",157.8,0.15],
+            ["BS",157.95,0.15],
+            ["A",158.1,0.15],
+            ["S",158.25,0.15],
+            ["XBS",158.4,0.3],
+            ["Y",158.7,0.3],
+            ["JET",159.0,0.15],
+            ["E",159.15,0.15],
+            ["E",159.3,0.15],
+            ["T",159.45,0.15],
+            ["T",159.6,0.3],
+            ["BMH",159.9,0.3],
+            ["G",160.2,0.15],
+            ["BD",160.35,0.15],
+            ["BD",160.5,0.15],
+            ["G",160.65,0.15],
+            ["CNDG",160.8,0.3],
+            ["T",161.1,0.3],
+            ["HQE",161.4,0.15],
+            ["Q",161.55,0.15],
+            ["Q",161.7,0.15],
+            ["ADHW",161.85,0.15],
+            ["W",162.0,0.3],
+            ["CNAG",162.3,0.3],
+            ["D",162.6,0.15],
+            ["CNS",162.75,0.15],
+            ["A",162.9,0.15],
+            ["NS",163.05,0.15],
+            ["CNAS",163.2,0.3],
+            ["T",163.5,0.3],
+            ["HQE",163.8,0.15],
+            ["Q",163.95,0.15],
+            ["Q",164.1,0.15],
+            ["ADHW",164.25,0.15],
+            ["W",164.4,0.3],
+            ["CNAG",164.7,0.3],
+            ["D",165.0,0.15],
+            ["CNA",165.15,0.15],
+            ["A",165.3,0.15],
+            ["NS",165.45,0.15],
+            ["BMGJ",165.6,0.3],
+            ["T",165.9,0.3],
+            ["GJE",166.2,0.15],
+            ["Q",166.35,0.15],
+            ["Q",166.5,0.15],
+            ["W",166.65,0.15],
+            ["W",166.8,0.3],
+            ["BMSJ",167.1,0.15],
+            ["XSW",167.25,0.15],
+            ["ED",167.4,0.3],
+            ["RF",167.7,0.3],
+            ["XBSG",168.0,0.3],
+            ["SGJT",168.3,0.3],
+            ["BSGJT",168.6,0.3],
+            ["BSGJT",168.9,0.3],
+            ["BSGJT",169.2,1.2],
+            ["VAW",170.4,0.3],
+            ["E",170.7,0.3],
+            ["T",171.0,0.3],
+            ["Q",171.3,0.3],
+            ["W",171.6,0.3],
+            ["BSE",171.9,0.3],
+            ["T",172.2,0.3],
+            ["Q",172.5,0.3],
+            ["NDW",172.8,0.3],
+            ["E",173.1,0.3],
+            ["T",173.4,0.3],
+            ["Y",173.7,0.3],
+            ["W",174.0,0.3],
+            ["BSE",174.3,0.3],
+            ["H",174.6,0.3],
+            ["Q",174.9,0.3],
+            ["VAW",175.2,0.3],
+            ["E",175.5,0.3],
+            ["T",175.8,0.3],
+            ["Q",176.1,0.3],
+            ["W",176.4,0.3],
+            ["BSE",176.7,0.3],
+            ["T",177.0,0.3],
+            ["Q",177.3,0.3],
+            ["NDW",177.6,0.3],
+            ["E",177.9,0.3],
+            ["T",178.2,0.3],
+            ["Y",178.5,0.3],
+            ["W",178.8,0.3],
+            ["BSE",179.1,0.3],
+            ["H",179.4,0.3],
+            ["Q",179.7,0.3],
+            ["VAHW",180.0,0.3],
+            ["E",180.3,0.3],
+            ["TQ",180.6,0.3],
+            ["AW",180.9,0.3],
+            ["V",181.2,0.3],
+            ["JE",181.5,0.3],
+            ["BMTG",181.8,0.3],
+            ["FQ",182.1,0.3],
+            ["NADW",182.4,0.3],
+            ["EG",182.7,0.3],
+            ["JT",183.0,0.3],
+            ["YQ",183.3,0.3],
+            ["W",183.6,0.3],
+            ["ZE",183.9,0.3],
+            ["QH",184.2,0.3],
+            ["J",184.5,0.3],
+            ["VAHW",184.8,0.3],
+            ["E",185.1,0.3],
+            ["QT",185.4,0.3],
+            ["A",185.7,0.3],
+            ["VJW",186.0,0.3],
+            ["GE",186.3,0.3],
+            ["BSGT",186.6,0.3],
+            ["GQ",186.9,0.3],
+            ["NADW",187.2,0.3],
+            ["E",187.5,0.3],
+            ["T",187.8,0.3],
+            ["Y",188.1,0.3],
+            ["W",188.4,0.3],
+            ["ZE",188.7,0.3],
+            ["ADH",189.0,0.3],
+            ["GQ",189.3,0.3],
+            ["VAHW",189.6,0.3],
+            ["E",189.9,0.3],
+            ["TQ",190.2,0.3],
+            ["AW",190.5,0.3],
+            ["V",190.8,0.3],
+            ["JE",191.1,0.3],
+            ["BMTG",191.4,0.3],
+            ["FQ",191.7,0.3],
+            ["NADW",192.0,0.3],
+            ["EG",192.3,0.3],
+            ["JT",192.6,0.3],
+            ["YQ",192.9,0.3],
+            ["W",193.2,0.3],
+            ["ZE",193.5,0.3],
+            ["QH",193.8,0.3],
+            ["J",194.1,0.3],
+            ["VAHW",194.4,0.3],
+            ["E",194.7,0.3],
+            ["QT",195.0,0.3],
+            ["A",195.3,0.3],
+            ["VJW",195.6,0.3],
+            ["G",195.9,0.3],
+            ["BSG",196.2,0.3],
+            ["GQ",196.5,0.3],
+            ["XBGW",196.8,0.3],
+            ["S",197.1,0.3],
+            ["BGQ",197.4,0.3],
+            ["S",197.7,0.3],
+            ["BGJ",198.0,0.3],
+            ["XB",198.3,0.15],
+            ["X",198.45,0.15],
+            ["DE",198.6,0.3],
+            ["GT",198.9,0.15],
+            ["ED",199.05,0.15],
+            ["ZVAW",199.2,0.3],
+            ["VQ",199.5,0.15],
+            ["N",199.65,0.15],
+            ["ADH",199.8,0.15],
+            ["Q",199.95,0.3],
+            ["ADW",200.25,0.3],
+            ["B",200.55,0.15],
+            ["MSG",200.7,0.3],
+            ["BDE",201.0,0.15],
+            ["MSG",201.15,0.15],
+            ["T",201.3,0.15],
+            ["E",201.45,0.15],
+            ["CNDHW",201.6,0.3],
+            ["Q",201.9,0.15],
+            ["N",202.05,0.15],
+            ["ADG",202.2,0.15],
+            ["Q",202.35,0.3],
+            ["ADQ",202.65,0.3],
+            ["ZC",202.95,0.15],
+            ["ADG",203.1,0.3],
+            ["E",203.4,0.15],
+            ["ADG",203.55,0.15],
+            ["T",203.7,0.15],
+            ["E",203.85,0.15],
+            ["ZVAFW",204.0,0.3],
+            ["V",204.3,0.15],
+            ["N",204.45,0.15],
+            ["ADE",204.6,0.15],
+            ["GT",204.75,0.3],
+            ["ADGT",205.05,0.3],
+            ["BHY",205.35,0.15],
+            ["MSG",205.5,0.3],
+            ["MSGT",205.8,0.15],
+            ["R",205.95,0.15],
+            ["E",206.1,0.3],
+            ["CNDH",206.4,0.3],
+            ["W",206.7,0.15],
+            ["HE",206.85,0.15],
+            ["ADGT",207.0,0.15],
+            ["Y",207.15,0.15],
+            ["E",207.3,0.15],
+            ["ADW",207.45,0.15],
+            ["E",207.6,0.3],
+            ["ZA",207.9,0.3],
+            ["ADGE",208.2,0.15],
+            ["ZA",208.35,0.15],
+            ["GT",208.5,0.15],
+            ["DE",208.65,0.15],
+            ["ZVAW",208.8,0.3],
+            ["VQ",209.1,0.15],
+            ["N",209.25,0.15],
+            ["ADH",209.4,0.15],
+            ["Q",209.55,0.3],
+            ["ADW",209.85,0.3],
+            ["B",210.15,0.15],
+            ["MSG",210.3,0.3],
+            ["BDE",210.6,0.15],
+            ["MSG",210.75,0.15],
+            ["T",210.9,0.15],
+            ["E",211.05,0.15],
+            ["CNDHW",211.2,0.3],
+            ["Q",211.5,0.15],
+            ["N",211.65,0.15],
+            ["ADG",211.8,0.15],
+            ["Q",211.95,0.3],
+            ["ADQ",212.25,0.3],
+            ["ZC",212.55,0.15],
+            ["ADG",212.7,0.3],
+            ["AQ",213.0,0.15],
+            ["ADGMJ",213.15,0.15],
+            ["NH",213.3,0.15],
+            ["MJ",213.45,0.15],
+            ["ZVAFH",213.6,0.3],
+            ["V",213.9,0.15],
+            ["N",214.05,0.15],
+            ["ADW",214.2,0.45],
+            ["AD",214.65,0.15],
+            ["J",214.8,0.15],
+            ["B",214.95,0.15],
+            ["H",215.1,0.3],
+            ["MSGJ",215.4,0.3],
+            ["MGJ",215.7,0.3],
+            ["V",216.0,0.3],
+            ["ZAQ",216.3,0.3],
+            ["BAG",216.6,0.3],
+            ["X",216.9,0.3],
+            ["NAD",217.2,0.3],
+            ["N",217.5,0.15],
+            ["AZ",217.65,0.15],
+            ["C",217.8,0.15],
+            ["B",217.95,0.15],
+            ["N",218.1,0.15],
+            ["A",218.25,0.15],
+            ["VNADH",218.4,0.3],
+            ["V",218.7,0.15],
+            ["N",218.85,0.15],
+            ["ADBG",219.0,0.15],
+            ["HN",219.15,0.15],
+            ["NQA",219.3,0.15],
+            ["AD",219.45,0.15],
+            ["WS",219.6,0.3],
+            ["XBSG",219.9,0.3],
+            ["SGE",220.2,0.15],
+            ["B",220.35,0.15],
+            ["Q",220.5,0.3],
+            ["CNADHQ",220.8,0.3],
+            ["N",221.1,0.15],
+            ["A",221.25,0.15],
+            ["DGE",221.4,0.15],
+            ["SW",221.55,0.15],
+            ["QA",221.7,0.15],
+            ["DG",221.85,0.15],
+            ["SW",222.0,0.3],
+            ["CD",222.3,0.3],
+            ["BADGT",222.6,0.15],
+            ["C",222.75,0.15],
+            ["E",222.9,0.3],
+            ["ZVADGQE",223.2,0.3],
+            ["V",223.5,0.15],
+            ["N",223.65,0.15],
+            ["ADQ",223.8,0.15],
+            ["MJ",223.95,0.15],
+            ["NG",224.1,0.15],
+            ["AD",224.25,0.15],
+            ["NH",224.4,0.3],
+            ["XBSG",224.7,0.3],
+            ["SG",225.0,0.15],
+            ["B",225.15,0.15],
+            ["F",225.3,0.3],
+            ["CNADG",225.6,0.3],
+            ["QN",225.9,0.15],
+            ["AW",226.05,0.15],
+            ["DGE",226.2,0.3],
+            ["AW",226.5,0.15],
+            ["DGE",226.65,0.15],
+            ["R",226.8,0.15],
+            ["W",226.95,0.15],
+            ["ZAE",227.1,0.15],
+            ["R",227.25,0.15],
+            ["DGT",227.4,0.15],
+            ["AY",227.55,0.15],
+            ["ZE",227.7,0.15],
+            ["W",227.85,0.15],
+            ["VNADH",228.0,0.3],
+            ["V",228.3,0.15],
+            ["N",228.45,0.15],
+            ["ADBG",228.6,0.15],
+            ["HN",228.75,0.15],
+            ["NQA",228.9,0.15],
+            ["AD",229.05,0.15],
+            ["WS",229.2,0.3],
+            ["BSG",229.5,0.3],
+            ["SGE",229.8,0.15],
+            ["B",229.95,0.15],
+            ["Q",230.1,0.3],
+            ["CNADHQ",230.4,0.3],
+            ["N",230.7,0.15],
+            ["A",230.85,0.15],
+            ["DGE",231.0,0.15],
+            ["SW",231.15,0.15],
+            ["QA",231.3,0.15],
+            ["DG",231.45,0.15],
+            ["SW",231.6,0.3],
+            ["CD",231.9,0.3],
+            ["ADGT",232.2,0.15],
+            ["C",232.35,0.15],
+            ["E",232.5,0.3],
+            ["VAFHQEY",232.8,0.3],
+            ["V",233.1,0.15],
+            ["N",233.25,0.15],
+            ["AD",233.4,0.3],
+            ["NDE",233.7,0.15],
+            ["AD",233.85,0.15],
+            ["SJW",234.0,0.3],
+            ["BSG",234.3,0.3],
+            ["SG",234.6,0.15],
+            ["B",234.75,0.15],
+            ["AQ",234.9,0.15],
+            ["WS",235.05,0.15],
+            ["VDHE",235.2,0.3],
+            ["A",235.5,0.3],
+            ["BG",235.8,0.3],
+            ["SW",236.1,0.15],
+            ["AQ",236.25,0.15],
+            ["NDHQ",236.4,0.3],
+            ["A",236.7,0.15],
+            ["S",236.85,0.15],
+            ["DN",237.0,0.15],
+            ["ZS",237.15,0.15],
+            ["CD",237.3,0.15],
+            ["BG",237.45,0.15],
+            ["VNADH",237.6,0.3],
+            ["V",237.9,0.15],
+            ["N",238.05,0.15],
+            ["ADBG",238.2,0.15],
+            ["HN",238.35,0.15],
+            ["NQA",238.5,0.15],
+            ["AD",238.65,0.15],
+            ["WS",238.8,0.3],
+            ["XBSG",239.1,0.3],
+            ["SGE",239.4,0.15],
+            ["B",239.55,0.15],
+            ["Q",239.7,0.3],
+            ["CNADHQ",240.0,0.3],
+            ["N",240.3,0.15],
+            ["A",240.45,0.15],
+            ["DGE",240.6,0.15],
+            ["SW",240.75,0.15],
+            ["QA",240.9,0.15],
+            ["DG",241.05,0.15],
+            ["SW",241.2,0.3],
+            ["CD",241.5,0.3],
+            ["BADGT",241.8,0.15],
+            ["C",241.95,0.15],
+            ["E",242.1,0.3],
+            ["ZVADGQE",242.4,0.3],
+            ["V",242.7,0.15],
+            ["N",242.85,0.15],
+            ["ADQ",243.0,0.15],
+            ["MJ",243.15,0.15],
+            ["NG",243.3,0.15],
+            ["AD",243.45,0.15],
+            ["NH",243.6,0.3],
+            ["XBSG",243.9,0.3],
+            ["SG",244.2,0.15],
+            ["B",244.35,0.15],
+            ["F",244.5,0.3],
+            ["CNADG",244.8,0.3],
+            ["QN",245.1,0.15],
+            ["AW",245.25,0.15],
+            ["DGE",245.4,0.3],
+            ["AW",245.7,0.15],
+            ["DGE",245.85,0.15],
+            ["R",246.0,0.15],
+            ["W",246.15,0.15],
+            ["ZAE",246.3,0.15],
+            ["R",246.45,0.15],
+            ["DGT",246.6,0.15],
+            ["AY",246.75,0.15],
+            ["ZE",246.9,0.15],
+            ["W",247.05,0.15],
+            ["VNADH",247.2,0.3],
+            ["V",247.5,0.15],
+            ["N",247.65,0.15],
+            ["ADBG",247.8,0.15],
+            ["HN",247.95,0.15],
+            ["NQA",248.1,0.15],
+            ["AD",248.25,0.15],
+            ["WS",248.4,0.3],
+            ["BSG",248.7,0.3],
+            ["SGE",249.0,0.15],
+            ["B",249.15,0.15],
+            ["Q",249.3,0.3],
+            ["CNADHQ",249.6,0.3],
+            ["N",249.9,0.15],
+            ["A",250.05,0.15],
+            ["DGE",250.2,0.15],
+            ["SW",250.35,0.15],
+            ["QA",250.5,0.15],
+            ["DG",250.65,0.15],
+            ["SW",250.8,0.3],
+            ["CD",251.1,0.3],
+            ["ADGT",251.4,0.15],
+            ["C",251.55,0.15],
+            ["E",251.7,0.3],
+            ["VAFHQEY",252.0,0.3],
+            ["V",252.3,0.15],
+            ["N",252.45,0.15],
+            ["AD",252.6,0.3],
+            ["NDE",252.9,0.15],
+            ["AD",253.05,0.15],
+            ["SJW",253.2,0.3],
+            ["BSG",253.5,0.3],
+            ["SG",253.8,0.15],
+            ["B",253.95,0.15],
+            ["AQ",254.1,0.15],
+            ["WS",254.25,0.15],
+            ["VDHE",254.4,0.3],
+            ["A",254.7,0.3],
+            ["BG",255.0,0.3],
+            ["SW",255.3,0.15],
+            ["AQ",255.45,0.15],
+            ["NDHQ",255.6,0.3],
+            ["N",255.9,0.15],
+            ["A",256.05,0.15],
+            ["D",256.2,0.15],
+            ["G",256.35,0.15],
+            ["H",256.5,0.15],
+            ["Q",256.65,0.15],
+            ["VAW",256.8,0.3],
+            ["E",257.1,0.3],
+            ["T",257.4,0.3],
+            ["Q",257.7,0.3],
+            ["W",258.0,0.3],
+            ["BSE",258.3,0.3],
+            ["T",258.6,0.3],
+            ["Q",258.9,0.3],
+            ["NDW",259.2,0.3],
+            ["E",259.5,0.3],
+            ["T",259.8,0.3],
+            ["Y",260.1,0.3],
+            ["W",260.4,0.3],
+            ["BSE",260.7,0.3],
+            ["H",261.0,0.3],
+            ["Q",261.3,0.3],
+            ["VAW",261.6,0.3],
+            ["E",261.9,0.3],
+            ["T",262.2,0.3],
+            ["Q",262.5,0.3],
+            ["W",262.8,0.3],
+            ["BSE",263.1,0.3],
+            ["T",263.4,0.3],
+            ["Q",263.7,0.3],
+            ["NDW",264.0,0.3],
+            ["E",264.3,0.3],
+            ["T",264.6,0.3],
+            ["Q",264.9,0.3],
+            ["W",265.2,0.35],
+            ["E",265.55,0.4],
+            ["Q",265.95,0.6],
+            ["W",266.55,0.3]
             ];
 
             const ROWS = [
-[["VAW",3,0],["E",3,0],["T",3,0],["Q",3,0],["W",3,0],["BSE",3,0],["T",3,0],["Q",3,0]],
+            [["VAW",3,0],["E",3,0],["T",3,0],["Q",3,0],["W",3,0],["BSE",3,0],["T",3,0],["Q",3,0]],
 
-[["NDW",3,0],["E",3,0],["T",3,0],["Y",3,0],["W",3,0],["BSE",3,0],["H",3,0],["Q",3,0]],
+            [["NDW",3,0],["E",3,0],["T",3,0],["Y",3,0],["W",3,0],["BSE",3,0],["H",3,0],["Q",3,0]],
 
-[["VAW",3,0],["E",3,0],["T",3,0],["Q",3,0],["W",3,0],["BSE",3,0],["T",3,0],["Q",3,0]],
+            [["VAW",3,0],["E",3,0],["T",3,0],["Q",3,0],["W",3,0],["BSE",3,0],["T",3,0],["Q",3,0]],
 
-[["CNDGW",3,0],["E",3,0],["T",3,0],["Y",3,0],["W",3,0],["ZBDE",3,0],["H",3,0],["Q",3,0]],
+            [["CNDGW",3,0],["E",3,0],["T",3,0],["Y",3,0],["W",3,0],["ZBDE",3,0],["H",3,0],["Q",3,0]],
 
-[["ZVADW",3,0],["ADE",3,0],["ADT",3,0],["ADQ",3,0],["ADW",3,0],["XBADE",3,0],["T",3,0],["ADQ",3,0]],
+            [["ZVADW",3,0],["ADE",3,0],["ADT",3,0],["ADQ",3,0],["ADW",3,0],["XBADE",3,0],["T",3,0],["ADQ",3,0]],
 
-[["CNWS",3,0],["NSE",3,0],["NST",3,0],["NSY",3,0],["NSW",3,0],["ZBSE",3,0],["NSH",3,0],["NSQ",3,0]],
+            [["CNWS",3,0],["NSE",3,0],["NST",3,0],["NSY",3,0],["NSW",3,0],["ZBSE",3,0],["NSH",3,0],["NSQ",3,0]],
 
-[["ZVADW",3,0],["ADE",3,0],["ADT",3,0],["ADQ",3,0],["ADW",3,0],["XBADE",3,0],["T",3,0],["ADQ",3,0]],
+            [["ZVADW",3,0],["ADE",3,0],["ADT",3,0],["ADQ",3,0],["ADW",3,0],["XBADE",3,0],["T",3,0],["ADQ",3,0]],
 
-[["CNWS",3,0],["NSE",3,0],["NST",3,0],["NSY",3,0],["NSW",3,0],["ZBADE",3,0],["D",3,0],["G",3,0]],
+            [["CNWS",3,0],["NSE",3,0],["NST",3,0],["NSY",3,0],["NSW",3,0],["ZBADE",3,0],["D",3,0],["G",3,0]],
 
-[["VNADH",3,0],["GQ",3,0],["W",3,0],["N",3,0],["BJ",3,0],["MSG",3,0],["F",3,0]],
+            [["VNADH",3,3],["GQ",3,0],["W",3,0],["N",3,0],["BJ",3,0],["MSG",3,0],["F",3,0]],
 
-[["NAD",3,0],["G",3,0],["GJ",3,0],["Q",3,0],["N",3,0],["Z",3,0],["ADGQ",3,0],["J",3,0]],
+            [["NAD",3,0],["G",3,0],["GJ",3,0],["Q",3,0],["N",3,0],["Z",3,0],["ADGQ",3,0],["J",3,0]],
 
-[["VAH",3,0],["GQ",3,0],["NJ",3,0],["BG",3,0],["MS",3,0],["G",3,0]],
+            [["VAH",3,3],["GQ",3,3],["NJ",3,0],["BG",3,0],["MS",3,0],["G",3,0]],
 
-[["CNAD",3,0],["S",3,0],["BS",3,0],["S",3,0],["NS",3,0],["ZS",3,0],["ZCBSD",3,0],["SG",3,0]],
+            [["CNAD",3,0],["S",3,0],["BS",3,0],["S",3,0],["NS",3,0],["ZS",3,0],["ZCBSD",3,0],["SG",3,0]],
 
-[["VADH",3,0],["GQ",3,0],["W",3,0],["N",3,0],["BJ",3,0],["MSG",3,0],["F",3,0]],
+            [["VADH",3,3],["GQ",3,0],["W",3,0],["N",3,0],["BJ",3,0],["MSG",3,0],["F",3,0]],
 
-[["NAD",3,0],["G",3,0],["GJ",3,0],["Q",3,0],["N",3,0],["Z",3,0],["ADGQ",3,0],["J",3,0]],
+            [["NAD",3,0],["G",3,0],["GJ",3,0],["Q",3,0],["N",3,0],["Z",3,0],["ADGQ",3,0],["J",3,0]],
 
-[["VAH",3,0],["GQ",3,0],["NJ",3,0],["BG",3,0],["MSG",3,0],["H",3,0]],
+            [["VAH",3,3],["GQ",3,3],["NJ",3,0],["BG",3,0],["MSG",3,0],["H",3,0]],
 
-[["CNAD",3,0],["S",3,0],["BS",3,0],["S",3,0],["NS",3,0],["ZS",3,0],["ZCBSH",3,0],["SJ",3,0]],
+            [["CNAD",3,0],["S",3,0],["BS",3,0],["S",3,0],["NS",3,0],["ZS",3,0],["ZCBSH",3,0],["SJ",3,0]],
 
-[["ZVADQ",6,0],["ADG",3,0],["VNA",3,0],["AGJ",3,0],["H",3,0],["XBGJ",3,0],["ADGQ",3,0],["XB",3,0]],
+            [["ZVADQ",6,0],["ADG",3,0],["VNA",3,0],["AGJ",3,0],["H",3,0],["XBGJ",3,0],["ADGQ",3,0],["XB",3,0]],
 
-[["CND",3,0],["GJ",3,0],["AD",3,0],["H",3,0],["N",3,0],["ADGJ",3,0],["HQ",3,0],["AGJ",3,0],["ADG",3,0],["AH",3,0]],
+            [["CND",3,0],["GJ",3,0],["AD",3,0],["H",3,0],["N",3,0],["ADGJ",3,0],["HQ",3,0],["AGJ",3,0],["ADG",3,0],["AH",3,0]],
 
-[["VADG",3,0],["ZA",3,0],["CB",3,0],["A",3,0],["V",3,0],["ZCBH",3,0],["DG",3,0],["BA",3,0],["NS",3,0],["BAD",3,0]],
+            [["VADG",3,0],["ZA",3,0],["CB",3,0],["A",3,0],["V",3,0],["ZCBH",3,0],["DG",3,0],["BA",3,0],["NS",3,0],["BAD",3,0]],
 
-[["CN",3,0],["S",3,0],["ZCB",3,0],["S",3,0],["N",3,0],["ZS",3,0],["S",3,0],["AS",3,0],["ASH",3,0],["ZSJ",3,0]],
+            [["CN",3,0],["S",3,0],["ZCB",3,0],["S",3,0],["N",3,0],["ZS",3,0],["S",3,0],["AS",3,0],["ASH",3,0],["ZSJ",3,0]],
 
-[["VADQ",3,0],["AD",3,0],["AD",3,0],["ADJ",3,0],["ADH",3,0],["XB",3,0],["ADJ",3,0],["BDQ",3,0],["D",3,0]],
+            [["VADQ",3,0],["AD",3,0],["AD",3,0],["ADJ",3,0],["ADH",3,0],["XB",3,0],["ADJ",3,0],["BDQ",3,0],["D",3,0]],
 
-[["CNS",3,0],["NSJ",3,0],["NSH",3,0],["NASGJ",3,0],["NSQ",3,0],["BAD",3,0],["SFW",3,0],["DGE",3,0],["RHF",3,0]],
+            [["CNS",3,0],["NSJ",3,0],["NSH",3,0],["NASGJ",3,0],["NSQ",3,0],["BAD",3,0],["SFW",3,0],["DGE",3,0],["RHF",3,0]],
 
-[["ZVNA",3,0],["AQ",3,0],["BAQ",3,0],["DE",3,0],["NSW",3,0],["AQ",3,0],["ADQ",3,0]],
+            [["ZVNA",3,0],["AQ",3,0],["BAQ",3,0],["DE",3,0],["NSW",3,0],["AQ",3,0],["ADQ",3,3]],
 
-[["ZCA",9,0],["DE",3,0],["GT",3,0],["ED",3,0]],
+            [["ZCA",9,9],["DE",3,0],["GT",3,0],["ED",3,0]],
 
-[["ZVAW",3,0],["VQ",3,0],["N",3,0],["ADH",3,0],["Q",3,0],["ADW",3,0],["B",3,0],["MSG",3,0],["BDE",3,0],["MSG",3,0],["T",3,0],["E",3,0]],
+            [["ZVAW",3,0],["VQ",3,0],["N",3,0],["ADH",3,0],["Q",3,0],["ADW",3,0],["B",3,0],["MSG",3,0],["BDE",3,0],["MSG",3,0],["T",3,0],["E",3,0]],
 
-[["CNDHW",3,0],["Q",3,0],["N",3,0],["ADG",3,0],["Q",3,0],["ADQ",3,0],["ZC",3,0],["ADG",3,0],["E",3,0],["ADG",3,0],["T",3,0],["E",3,0]],
+            [["CNDHW",3,0],["Q",3,0],["N",3,0],["ADG",3,0],["Q",3,0],["ADQ",3,0],["ZC",3,0],["ADG",3,0],["E",3,0],["ADG",3,0],["T",3,0],["E",3,0]],
 
-[["ZVAFW",3,0],["V",3,0],["N",3,0],["ADE",3,0],["GT",3,0],["ADGT",6,0],["BHY",3,0],["MSG",3,0],["MSGT",3,0],["R",3,0],["E",3,0]],
+            [["ZVAFW",3,0],["V",3,0],["N",3,0],["ADE",3,0],["GT",3,0],["ADGT",6,0],["BHY",3,0],["MSG",3,0],["MSGT",3,0],["R",3,0],["E",3,0]],
 
-[["CNDH",3,0],["W",3,0],["HE",3,0],["ADGT",3,0],["Y",3,0],["E",3,0],["ADW",3,0],["E",3,0],["ZA",3,0],["ADGE",3,0],["ZA",3,0],["GT",3,0],["DE",3,0]],
+            [["CNDH",3,0],["W",3,0],["HE",3,0],["ADGT",3,0],["Y",3,0],["E",3,0],["ADW",3,0],["E",3,0],["ZA",3,0],["ADGE",3,0],["ZA",3,0],["GT",3,0],["DE",3,0]],
 
-[["ZVAW",3,0],["VQ",3,0],["N",3,0],["ADH",3,0],["Q",3,0],["ADW",3,0],["B",3,0],["MSG",3,0],["BDE",3,0],["MSG",3,0],["T",3,0],["E",3,0]],
+            [["ZVAW",3,0],["VQ",3,0],["N",3,0],["ADH",3,0],["Q",3,0],["ADW",3,0],["B",3,0],["MSG",3,0],["BDE",3,0],["MSG",3,0],["T",3,0],["E",3,0]],
 
-[["CNDHW",3,0],["Q",3,0],["N",3,0],["ADG",3,0],["Q",3,0],["ADQ",3,0],["ZC",3,0],["ADG",3,0],["AQ",3,0],["ADGMJ",3,0],["NH",3,0],["MJ",3,0]],
+            [["CNDHW",3,0],["Q",3,0],["N",3,0],["ADG",3,0],["Q",3,0],["ADQ",3,0],["ZC",3,0],["ADG",3,0],["AQ",3,0],["ADGMJ",3,0],["NH",3,0],["MJ",3,0]],
 
-[["ZVAFH",3,0],["V",3,0],["N",3,0],["ADW",6,0],["AD",3,0],["J",3,0],["B",3,0],["H",3,0],["MSGJ",3,0],["MGJ",3,0]],
+            [["ZVAFH",3,0],["V",3,0],["N",3,0],["ADW",6,0],["AD",3,0],["J",3,0],["B",3,0],["H",3,0],["MSGJ",3,0],["MGJ",3,0]],
 
-[["V",3,0],["ZAQ",3,0],["BAG",3,0],["X",3,0],["NAD",3,0],["N",3,0],["AZ",3,0],["C",3,0],["B",3,0],["N",3,0],["A",3,0]],
+            [["V",3,0],["ZAQ",3,0],["BAG",3,0],["X",3,0],["NAD",3,0],["N",3,0],["AZ",3,0],["C",3,0],["B",3,0],["N",3,0],["A",3,0]],
 
-[["VADW",3,0],["E",3,0],["T",3,0],["Q",3,0],["W",3,0],["BSE",3,0],["T",3,0],["Q",3,0]],
+            [["VADW",3,0],["E",3,0],["T",3,0],["Q",3,0],["W",3,0],["BSE",3,0],["T",3,0],["Q",3,0]],
 
-[["NDGW",3,0],["E",3,0],["T",3,0],["Y",3,0],["W",3,0],["ZBDE",3,0],["H",3,0],["Q",3,0]],
+            [["NDGW",3,0],["E",3,0],["T",3,0],["Y",3,0],["W",3,0],["ZBDE",3,0],["H",3,0],["Q",3,0]],
 
-[["VADW",3,0],["E",3,0],["T",3,0],["Q",3,0],["W",3,0],["BSE",3,0],["ADT",3,0],["ADQ",3,0]],
+            [["VADW",3,0],["E",3,0],["T",3,0],["Q",3,0],["W",3,0],["BSE",3,0],["ADT",3,0],["ADQ",3,0]],
 
-[["NASW",3,0],["SE",3,0],["ST",3,0],["SQ",3,0],["SW",3,0],["SE",3,0],["Q",3,0],["W",3,0]],
+            [["NASW",3,0],["SE",3,0],["ST",3,0],["SQ",3,0],["SW",3,0],["SE",3,3],["Q",3,0],["W",3,0]],
 
-[["VNAE",3,0],["W",3,0],["Q",3,0],["NADQ",3,0],["H",3,0],["J",3,0],["Q",3,0],["XBMSJ",3,0],["H",3,0],["BG",3,0],["BD",3,0],["G",3,0]],
+            [["VNAE",3,0],["W",3,0],["Q",3,0],["NADQ",3,0],["H",3,0],["J",3,0],["Q",3,0],["XBMSJ",3,0],["H",3,0],["BG",3,0],["BD",3,0],["G",3,0]],
 
-[["CNADH",3,0],["J",3,0],["Q",3,0],["ADJ",3,0],["G",3,0],["G",3,0],["H",3,0],["G",3,0],["ZBA",3,0],["CD",3,0],["D",3,0],["ZG",3,0],["G",3,0]],
+            [["CNADH",3,0],["J",3,0],["Q",3,0],["ADJ",3,0],["G",3,0],["G",3,0],["H",3,0],["G",3,0],["ZBA",3,0],["CD",3,0],["D",3,0],["ZG",3,0],["G",3,0]],
 
-[["VNAH",3,0],["J",3,0],["Q",3,0],["NADJ",3,0],["Q",3,0],["W",3,0],["E",3,0],["XBMSW",3,0],["Q",3,0],["MJ",3,0],["BG",3,0],["G",3,0]],
+            [["VNAH",3,0],["J",3,0],["Q",3,0],["NADJ",3,0],["Q",3,0],["W",3,0],["E",3,0],["XBMSW",3,0],["Q",3,0],["MJ",3,0],["BG",3,0],["G",3,0]],
 
-[["NAD",3,0],["Q",3,0],["W",3,0],["ADE",3,0],["W",3,0],["DE",3,0],["T",3,0],["Y",3,0],["ZBE",3,0],["W",3,0],["AD",3,0],["ZQ",3,0],["W",3,0]],
+            [["NAD",3,0],["Q",3,0],["W",3,0],["ADE",3,0],["W",3,0],["DE",3,0],["T",3,0],["Y",3,0],["ZBE",3,0],["W",3,0],["AD",3,0],["ZQ",3,0],["W",3,0]],
 
-[["ZVNAE",3,0],["W",3,0],["Q",3,0],["NADQ",3,0],["H",3,0],["J",3,0],["Q",3,0],["XBMSJ",3,0],["H",3,0],["BG",3,0],["BD",3,0],["G",3,0]],
+            [["ZVNAE",3,0],["W",3,0],["Q",3,0],["NADQ",3,0],["H",3,0],["J",3,0],["Q",3,0],["XBMSJ",3,0],["H",3,0],["BG",3,0],["BD",3,0],["G",3,0]],
 
-[["CNADH",3,0],["J",3,0],["Q",3,0],["ADJ",3,0],["G",3,0],["G",3,0],["H",3,0],["G",3,0],["ZBA",3,0],["NH",3,0],["Z",3,0],["G",3,0]],
+            [["CNADH",3,0],["J",3,0],["Q",3,0],["ADJ",3,0],["G",3,0],["G",3,0],["H",3,0],["G",3,0],["ZBA",3,0],["NH",3,0],["Z",3,0],["G",3,0]],
 
-[["ZVNA",3,0],["FH",3,0],["NAD",3,0],["HQ",6,0],["W",3,0],["BMS",3,0],["QE",3,0],["XBMS",3,0],["BJW",3,0]],
+            [["ZVNA",3,0],["FH",3,0],["NAD",3,0],["HQ",6,0],["W",3,0],["BMS",3,0],["QE",3,0],["XBMS",3,0],["BJW",3,0]],
 
-[["CNAD",3,0],["HQ",6,0],["CNA",3,0],["N",3,0],["A",3,0],["S",3,0],["DA",3,0],["B",3,0],["AG",3,0],["S",3,0],["CD",3,0]],
+            [["CNAD",3,0],["HQ",6,0],["CNA",3,0],["N",3,0],["A",3,0],["S",3,0],["DA",3,0],["B",3,0],["AG",3,0],["S",3,0],["CD",3,0]],
 
-[["VAFHQEY",3,0],["V",3,0],["A",3,0],["FHT",3,0],["R",3,0],["FH",3,0],["DE",3,0],["B",3,0],["MSGW",3,0],["DE",3,0],["BFR",3,0]],
+            [["VAFHQEY",3,0],["V",3,0],["A",3,0],["FHT",3,0],["R",3,0],["FH",3,0],["DE",3,0],["B",3,0],["MSGW",3,0],["DE",3,0],["BFR",3,0]],
 
-[["NDH",3,0],["ED",3,0],["NSW",3,0],["AQ",3,0],["DG",3,0],["SW",3,0],["ED",3,0],["DGE",6,0],["DE",3,0],["ZSW",3,0],["AQ",3,0],["ZCB",3,0],["NH",3,0],["ZMJ",3,0],["AQ",3,0]],
+            [["NDH",3,0],["ED",3,0],["NSW",3,0],["AQ",3,0],["DG",3,0],["SW",3,0],["ED",3,0],["DGE",6,0],["DE",3,0],["ZSW",3,0],["AQ",3,0],["ZCB",3,0],["NH",3,0],["ZMJ",3,0],["AQ",3,0]],
 
-[["VAF",3,0],["MJ",3,0],["VNH",3,0],["BAG",3,0],["VN",3,0],["G",3,0],["VN",3,0],["FH",3,0],["B",3,0],["HQ",3,0],["MSG",3,0],["BGJ",3,0]],
+            [["VAF",3,0],["MJ",3,0],["VNH",3,0],["BAG",3,0],["VN",3,0],["G",3,0],["VN",3,0],["FH",3,0],["B",3,0],["HQ",3,0],["MSG",3,0],["BGJ",3,0]],
 
-[["CND",3,0],["DG",3,0],["N",3,0],["A",3,0],["CBAD",6,0],["CBDH",3,0],["N",3,0],["A",3,0],["ZS",3,0],["D",3,0],["CBG",3,0],["H",3,0],["Q",3,0],["W",3,0]],
+            [["CND",3,0],["DG",3,0],["N",3,0],["A",3,0],["CBAD",6,0],["CBDH",3,0],["N",3,0],["A",3,0],["ZS",3,0],["D",3,0],["CBG",3,0],["H",3,0],["Q",3,0],["W",3,0]],
 
-[["VAFHQEY",3,0],["V",3,0],["A",3,0],["FHT",3,0],["R",3,0],["FH",3,0],["DE",3,0],["B",3,0],["MSGW",3,0],["DE",3,0],["BFR",3,0]],
+            [["VAFHQEY",3,0],["V",3,0],["A",3,0],["FHT",3,0],["R",3,0],["FH",3,0],["DE",3,0],["B",3,0],["MSGW",3,0],["DE",3,0],["BFR",3,0]],
 
-[["DH",3,0],["AD",3,0],["ADQE",3,0],["JW",3,0],["ADQE",3,0],["AD",3,0],["AD",3,0],["ZBMS",3,0],["MS",3,0]],
+            [["DH",3,0],["AD",3,0],["ADQE",3,0],["JW",3,0],["ADQE",3,0],["AD",3,0],["AD",3,0],["ZBMS",3,0],["MS",3,0]],
 
-[["VAD",3,0],["AD",3,0],["AD",3,0],["ADWR",3,0],["ADQE",3,0],["ADJW",3,0],["BSGQ",3,0],["AQ",3,0]],
+            [["VAD",3,0],["AD",3,0],["AD",3,0],["ADWR",3,0],["ADQE",3,0],["ADJW",3,0],["BSGQ",3,0],["AQ",3,0]],
 
-[["VAD",3,0],["V",3,0],["N",3,0],["AD",3,0],["V",3,0],["NAD",3,0],["V",3,0],["NAD",3,0],["V",3,0],["DA",3,0]],
+            [["VAD",3,0],["V",3,0],["N",3,0],["AD",3,0],["V",3,0],["NAD",3,0],["V",3,0],["NAD",3,0],["V",3,0],["DA",3,0]],
 
-[["VNASD",3,0],["V",3,0],["N",3,0],["AD",3,0],["V",3,0],["NAD",3,0],["V",3,0],["NAD",3,0],["V",3,0],["DA",3,0]],
+            [["VNASD",3,0],["V",3,0],["N",3,0],["AD",3,0],["V",3,0],["NAD",3,0],["V",3,0],["NAD",3,0],["V",3,0],["DA",3,0]],
 
-[["BASG",3,0],["GB",3,0],["AG",3,0],["SG",3,0],["G",3,0],["BG",3,0],["SG",3,0],["H",3,0],["H",3,0],["BH",3,0],["H",3,0],["SGQ",3,0],["Q",3,0],["BAQ",3,0],["AQ",3,0]],
+            [["BASG",3,0],["GB",3,0],["AG",3,0],["SG",3,0],["G",3,0],["BG",3,0],["SG",3,0],["H",3,0],["H",3,0],["BH",3,0],["H",3,0],["SGQ",3,0],["Q",3,0],["BAQ",3,0],["AQ",3,0]],
 
-[["BSGW",3,0],["WS",3,0],["BSW",3,0],["SW",3,0],["BDGE",3,0],["DE",3,0],["BDE",3,0],["DE",3,0],["BGT",3,0],["GT",3,0],["BGT",3,0],["GT",3,0],["DE",3,0],["GT",3,0],["ED",3,0]],
+            [["BSGW",3,0],["WS",3,0],["BSW",3,0],["SW",3,0],["BDGE",3,0],["DE",3,0],["BDE",3,0],["DE",3,0],["BGT",3,0],["GT",3,0],["BGT",3,0],["GT",3,0],["DE",3,0],["GT",3,0],["ED",3,0]],
 
-[["ZVAW",3,0],["VQ",3,0],["N",3,0],["ADH",3,0],["Q",3,0],["ADW",3,0],["B",3,0],["MSG",3,0],["BDE",3,0],["MSG",3,0],["T",3,0],["E",3,0]],
+            [["ZVAW",3,0],["VQ",3,0],["N",3,0],["ADH",3,0],["Q",3,0],["ADW",3,0],["B",3,0],["MSG",3,0],["BDE",3,0],["MSG",3,0],["T",3,0],["E",3,0]],
 
-[["CNDHW",3,0],["Q",3,0],["N",3,0],["ADG",3,0],["Q",3,0],["ADQ",3,0],["ZC",3,0],["ADG",3,0],["E",3,0],["ADG",3,0],["T",3,0],["E",3,0]],
+            [["CNDHW",3,0],["Q",3,0],["N",3,0],["ADG",3,0],["Q",3,0],["ADQ",3,0],["ZC",3,0],["ADG",3,0],["E",3,0],["ADG",3,0],["T",3,0],["E",3,0]],
 
-[["ZVAFW",3,0],["V",3,0],["N",3,0],["ADE",3,0],["GT",3,0],["ADGT",6,0],["BHY",3,0],["MSG",3,0],["MSGT",3,0],["R",3,0],["E",3,0]],
+            [["ZVAFW",3,0],["V",3,0],["N",3,0],["ADE",3,0],["GT",3,0],["ADGT",6,0],["BHY",3,0],["MSG",3,0],["MSGT",3,0],["R",3,0],["E",3,0]],
 
-[["CNDH",3,0],["W",3,0],["HE",3,0],["ADGT",3,0],["Y",3,0],["E",3,0],["ADW",3,0],["E",3,0],["ZA",3,0],["ADGE",3,0],["ZA",3,0],["GT",3,0],["DE",3,0]],
+            [["CNDH",3,0],["W",3,0],["HE",3,0],["ADGT",3,0],["Y",3,0],["E",3,0],["ADW",3,0],["E",3,0],["ZA",3,0],["ADGE",3,0],["ZA",3,0],["GT",3,0],["DE",3,0]],
 
-[["ZVAW",3,0],["VQ",3,0],["N",3,0],["ADH",3,0],["Q",3,0],["ADW",3,0],["B",3,0],["MSG",3,0],["BDE",3,0],["MSG",3,0],["T",3,0],["E",3,0]],
+            [["ZVAW",3,0],["VQ",3,0],["N",3,0],["ADH",3,0],["Q",3,0],["ADW",3,0],["B",3,0],["MSG",3,0],["BDE",3,0],["MSG",3,0],["T",3,0],["E",3,0]],
 
-[["CNDHW",3,0],["Q",3,0],["N",3,0],["ADG",3,0],["Q",3,0],["ADQ",3,0],["ZC",3,0],["ADG",3,0],["AQ",3,0],["ADGMJ",3,0],["NH",3,0],["MJ",3,0]],
+            [["CNDHW",3,0],["Q",3,0],["N",3,0],["ADG",3,0],["Q",3,0],["ADQ",3,0],["ZC",3,0],["ADG",3,0],["AQ",3,0],["ADGMJ",3,0],["NH",3,0],["MJ",3,0]],
 
-[["ZVAFH",3,0],["V",3,0],["N",3,0],["ADW",6,0],["AD",3,0],["J",3,0],["B",3,0],["H",3,0],["MSGJ",3,0],["MGJ",3,0]],
+            [["ZVAFH",3,0],["V",3,0],["N",3,0],["ADW",6,0],["AD",3,0],["J",3,0],["B",3,0],["H",3,0],["MSGJ",3,0],["MGJ",3,0]],
 
-[["V",3,0],["AQ",3,0],["Z",3,0],["BADHQ",3,0],["X",3,0],["NADH",3,0],["N",3,0],["N",3,0],["BADG",3,0],["H",3,0],["D",3,0],["N",3,0]],
+            [["V",3,0],["AQ",3,0],["Z",3,0],["BADHQ",3,0],["X",3,0],["NADH",3,0],["N",3,0],["N",3,0],["BADG",3,0],["H",3,0],["D",3,0],["N",3,0]],
 
-[["ZVAF",3,0],["T",3,0],["GQE",3,0],["W",3,0],["Q",3,0],["W",3,0],["W",3,0],["ZVAG",3,0],["D",3,0],["VS",3,0],["A",3,0],["S",3,0]],
+            [["ZVAF",3,0],["T",3,0],["GQE",3,0],["W",3,0],["Q",3,0],["W",3,0],["W",3,0],["ZVAG",3,0],["D",3,0],["VS",3,0],["A",3,0],["S",3,0]],
 
-[["ZVAF",3,0],["T",3,0],["GQE",3,0],["W",3,0],["Q",3,0],["W",3,0],["W",3,0],["ZVAG",3,0],["D",3,0],["VS",3,0],["A",3,0],["S",3,0]],
+            [["ZVAF",3,0],["T",3,0],["GQE",3,0],["W",3,0],["Q",3,0],["W",3,0],["W",3,0],["ZVAG",3,0],["D",3,0],["VS",3,0],["A",3,0],["S",3,0]],
 
-[["XBSG",3,0],["T",3,0],["GJE",3,0],["W",3,0],["Q",3,0],["W",3,0],["W",3,0],["BMG",3,0],["D",3,0],["BS",3,0],["A",3,0],["S",3,0]],
+            [["XBSG",3,0],["T",3,0],["GJE",3,0],["W",3,0],["Q",3,0],["W",3,0],["W",3,0],["BMG",3,0],["D",3,0],["BS",3,0],["A",3,0],["S",3,0]],
 
-[["XBS",3,0],["Y",3,0],["JET",3,0],["E",3,0],["E",3,0],["T",3,0],["T",3,0],["BMH",3,0],["G",3,0],["BD",3,0],["BD",3,0],["G",3,0]],
+            [["XBS",3,0],["Y",3,0],["JET",3,0],["E",3,0],["E",3,0],["T",3,0],["T",3,0],["BMH",3,0],["G",3,0],["BD",3,0],["BD",3,0],["G",3,0]],
 
-[["CNDG",3,0],["T",3,0],["HQE",3,0],["Q",3,0],["Q",3,0],["ADHW",3,0],["W",3,0],["CNAG",3,0],["D",3,0],["CNS",3,0],["A",3,0],["NS",3,0]],
+            [["CNDG",3,0],["T",3,0],["HQE",3,0],["Q",3,0],["Q",3,0],["ADHW",3,0],["W",3,0],["CNAG",3,0],["D",3,0],["CNS",3,0],["A",3,0],["NS",3,0]],
 
-[["CNAS",3,0],["T",3,0],["HQE",3,0],["Q",3,0],["Q",3,0],["ADHW",3,0],["W",3,0],["CNAG",3,0],["D",3,0],["CNA",3,0],["A",3,0],["NS",3,0]],
+            [["CNAS",3,0],["T",3,0],["HQE",3,0],["Q",3,0],["Q",3,0],["ADHW",3,0],["W",3,0],["CNAG",3,0],["D",3,0],["CNA",3,0],["A",3,0],["NS",3,0]],
 
-[["BMGJ",3,0],["T",3,0],["GJE",3,0],["Q",3,0],["Q",3,0],["W",3,0],["W",3,0],["BMSJ",3,0],["XSW",3,0],["ED",3,0],["RF",3,0]],
+            [["BMGJ",3,0],["T",3,0],["GJE",3,0],["Q",3,0],["Q",3,0],["W",3,0],["W",3,0],["BMSJ",3,0],["XSW",3,0],["ED",3,0],["RF",3,0]],
 
-[["XBSG",3,0],["SGJT",3,0],["BSGJT",3,0],["BSGJT",3,0],["BSGJT",6,0]],
+            [["XBSG",3,0],["SGJT",3,0],["BSGJT",3,0],["BSGJT",3,0],["BSGJT",6,6]],
 
-[["VAW",3,0],["E",3,0],["T",3,0],["Q",3,0],["W",3,0],["BSE",3,0],["T",3,0],["Q",3,0]],
+            [["VAW",3,0],["E",3,0],["T",3,0],["Q",3,0],["W",3,0],["BSE",3,0],["T",3,0],["Q",3,0]],
 
-[["NDW",3,0],["E",3,0],["T",3,0],["Y",3,0],["W",3,0],["BSE",3,0],["H",3,0],["Q",3,0]],
+            [["NDW",3,0],["E",3,0],["T",3,0],["Y",3,0],["W",3,0],["BSE",3,0],["H",3,0],["Q",3,0]],
 
-[["VAW",3,0],["E",3,0],["T",3,0],["Q",3,0],["W",3,0],["BSE",3,0],["T",3,0],["Q",3,0]],
+            [["VAW",3,0],["E",3,0],["T",3,0],["Q",3,0],["W",3,0],["BSE",3,0],["T",3,0],["Q",3,0]],
 
-[["NDW",3,0],["E",3,0],["T",3,0],["Q",3,0],["W",4,0],["E",2,0],["Q",3,0],["W",1,0]]
+            [["NDW",3,0],["E",3,0],["T",3,0],["Y",3,0],["W",3,0],["BSE",3,0],["H",3,0],["Q",3,0]],
+
+            [["VAHW",3,0],["E",3,0],["TQ",3,0],["AW",3,0],["V",3,0],["JE",3,0],["BMTG",3,0],["FQ",3,0]],
+
+            [["NADW",3,0],["EG",3,0],["JT",3,0],["YQ",3,0],["W",3,0],["ZE",3,0],["QH",3,0],["J",3,0]],
+
+            [["VAHW",3,0],["E",3,0],["QT",3,0],["A",3,0],["VJW",3,0],["GE",3,0],["BSGT",3,0],["GQ",3,0]],
+
+            [["NADW",3,0],["E",3,0],["T",3,0],["Y",3,0],["W",3,0],["ZE",3,0],["ADH",3,0],["GQ",3,0]],
+
+            [["VAHW",3,0],["E",3,0],["TQ",3,0],["AW",3,0],["V",3,0],["JE",3,0],["BMTG",3,0],["FQ",3,0]],
+
+            [["NADW",3,0],["EG",3,0],["JT",3,0],["YQ",3,0],["W",3,0],["ZE",3,0],["QH",3,0],["J",3,0]],
+
+            [["VAHW",3,0],["E",3,0],["QT",3,0],["A",3,0],["VJW",3,0],["G",3,0],["BSG",3,0],["GQ",3,0]],
+
+            [["XBGW",3,0],["S",3,0],["BGQ",3,0],["S",3,0],["BGJ",3,0],["XB",3,0],["X",3,0],["DE",3,0],["GT",3,0],["ED",3,0]],
+
+            [["ZVAW",3,0],["VQ",3,0],["N",3,0],["ADH",3,0],["Q",3,0],["ADW",3,0],["B",3,0],["MSG",3,0],["BDE",3,0],["MSG",3,0],["T",3,0],["E",3,0]],
+
+            [["CNDHW",3,0],["Q",3,0],["N",3,0],["ADG",3,0],["Q",3,0],["ADQ",3,0],["ZC",3,0],["ADG",3,0],["E",3,0],["ADG",3,0],["T",3,0],["E",3,0]],
+
+            [["ZVAFW",3,0],["V",3,0],["N",3,0],["ADE",3,0],["GT",3,0],["ADGT",6,0],["BHY",3,0],["MSG",3,0],["MSGT",3,0],["R",3,0],["E",3,0]],
+
+            [["CNDH",3,0],["W",3,0],["HE",3,0],["ADGT",3,0],["Y",3,0],["E",3,0],["ADW",3,0],["E",3,0],["ZA",3,0],["ADGE",3,0],["ZA",3,0],["GT",3,0],["DE",3,0]],
+
+            [["ZVAW",3,0],["VQ",3,0],["N",3,0],["ADH",3,0],["Q",3,0],["ADW",3,0],["B",3,0],["MSG",3,0],["BDE",3,0],["MSG",3,0],["T",3,0],["E",3,0]],
+
+            [["CNDHW",3,0],["Q",3,0],["N",3,0],["ADG",3,0],["Q",3,0],["ADQ",3,0],["ZC",3,0],["ADG",3,0],["AQ",3,0],["ADGMJ",3,0],["NH",3,0],["MJ",3,0]],
+
+            [["ZVAFH",3,0],["V",3,0],["N",3,0],["ADW",6,0],["AD",3,0],["J",3,0],["B",3,0],["H",3,0],["MSGJ",3,0],["MGJ",3,0]],
+
+            [["V",3,0],["ZAQ",3,0],["BAG",3,0],["X",3,0],["NAD",3,0],["N",3,0],["AZ",3,0],["C",3,0],["B",3,0],["N",3,0],["A",3,0]],
+
+            [["VNADH",3,0],["V",3,0],["N",3,0],["ADBG",3,0],["HN",3,0],["NQA",3,0],["AD",3,0],["WS",3,0],["XBSG",3,0],["SGE",3,0],["B",3,0],["Q",3,0]],
+
+            [["CNADHQ",3,0],["N",3,0],["A",3,0],["DGE",3,0],["SW",3,0],["QA",3,0],["DG",3,0],["SW",3,0],["CD",3,0],["BADGT",3,0],["C",3,0],["E",3,0]],
+
+            [["ZVADGQE",3,0],["V",3,0],["N",3,0],["ADQ",3,0],["MJ",3,0],["NG",3,0],["AD",3,0],["NH",3,0],["XBSG",3,0],["SG",3,0],["B",3,0],["F",3,0]],
+
+            [["CNADG",3,0],["QN",3,0],["AW",3,0],["DGE",3,0],["AW",3,0],["DGE",3,0],["R",3,0],["W",3,0],["ZAE",3,0],["R",3,0],["DGT",3,0],["AY",3,0],["ZE",3,0],["W",3,0]],
+
+            [["VNADH",3,0],["V",3,0],["N",3,0],["ADBG",3,0],["HN",3,0],["NQA",3,0],["AD",3,0],["WS",3,0],["BSG",3,0],["SGE",3,0],["B",3,0],["Q",3,0]],
+
+            [["CNADHQ",3,0],["N",3,0],["A",3,0],["DGE",3,0],["SW",3,0],["QA",3,0],["DG",3,0],["SW",3,0],["CD",3,0],["ADGT",3,0],["C",3,0],["E",3,0]],
+
+            [["VAFHQEY",3,0],["V",3,0],["N",3,0],["AD",3,0],["NDE",3,0],["AD",3,0],["SJW",3,0],["BSG",3,0],["SG",3,0],["B",3,0],["AQ",3,0],["WS",3,0]],
+
+            [["VDHE",3,0],["A",3,0],["BG",3,0],["SW",3,0],["AQ",3,0],["NDHQ",3,0],["A",3,0],["S",3,0],["DN",3,0],["ZS",3,0],["CD",3,0],["BG",3,0]],
+
+            [["VNADH",3,0],["V",3,0],["N",3,0],["ADBG",3,0],["HN",3,0],["NQA",3,0],["AD",3,0],["WS",3,0],["XBSG",3,0],["SGE",3,0],["B",3,0],["Q",3,0]],
+
+            [["CNADHQ",3,0],["N",3,0],["A",3,0],["DGE",3,0],["SW",3,0],["QA",3,0],["DG",3,0],["SW",3,0],["CD",3,0],["BADGT",3,0],["C",3,0],["E",3,0]],
+
+            [["ZVADGQE",3,0],["V",3,0],["N",3,0],["ADQ",3,0],["MJ",3,0],["NG",3,0],["AD",3,0],["NH",3,0],["XBSG",3,0],["SG",3,0],["B",3,0],["F",3,0]],
+
+            [["CNADG",3,0],["QN",3,0],["AW",3,0],["DGE",3,0],["AW",3,0],["DGE",3,0],["R",3,0],["W",3,0],["ZAE",3,0],["R",3,0],["DGT",3,0],["AY",3,0],["ZE",3,0],["W",3,0]],
+
+            [["VNADH",3,0],["V",3,0],["N",3,0],["ADBG",3,0],["HN",3,0],["NQA",3,0],["AD",3,0],["WS",3,0],["BSG",3,0],["SGE",3,0],["B",3,0],["Q",3,0]],
+
+            [["CNADHQ",3,0],["N",3,0],["A",3,0],["DGE",3,0],["SW",3,0],["QA",3,0],["DG",3,0],["SW",3,0],["CD",3,0],["ADGT",3,0],["C",3,0],["E",3,0]],
+
+            [["VAFHQEY",3,0],["V",3,0],["N",3,0],["AD",3,0],["NDE",3,0],["AD",3,0],["SJW",3,0],["BSG",3,0],["SG",3,0],["B",3,0],["AQ",3,0],["WS",3,0]],
+
+            [["VDHE",3,0],["A",3,0],["BG",3,0],["SW",3,0],["AQ",3,0],["NDHQ",3,0],["N",3,0],["A",3,0],["D",3,0],["G",3,0],["H",3,0],["Q",3,0]],
+
+            [["VAW",3,0],["E",3,0],["T",3,0],["Q",3,0],["W",3,0],["BSE",3,0],["T",3,0],["Q",3,0]],
+
+            [["NDW",3,0],["E",3,0],["T",3,0],["Y",3,0],["W",3,0],["BSE",3,0],["H",3,0],["Q",3,0]],
+
+            [["VAW",3,0],["E",3,0],["T",3,0],["Q",3,0],["W",3,0],["BSE",3,0],["T",3,0],["Q",3,0]],
+
+            [["NDW",3,0],["E",3,0],["T",3,0],["Q",3,0],["W",4,0],["E",2,2],["Q",3,3],["W",1,0]]
             ];
 
             // 键 -> 频率（与页面三排键盘 data-frequency 完全一致）
@@ -2902,6 +3627,71 @@
             function playTone(freq) {
                 return Synth.play(currentSoundType, freq);
             }
+
+            /* ---------------- 自动演奏的声部账本 ----------------
+             * 音头是提前挂到音频时钟上的（最多提前 LOOKAHEAD），所以"已经排进音频图"
+             * 和"已经响着"是两回事。账本记下每个声部的参数，用来：
+             *   · 中止/暂停时把还没开始响的那批**直接掐掉** —— 否则按了停止还会继续弹；
+             *   · 切音色时把还没开始响的那批**用新音色重排** —— 否则要等 LOOKAHEAD
+             *     那么久才换过来（听起来像"切了没反应"）。
+             */
+            const autoVoices = [];     // { type, freq, dur, vel, keyChar, rel, at, v, timer }
+
+            function scheduleAutoVoice(type, freq, dur, vel, keyChar, rel, at) {
+                const v = Synth.play(type, freq, { vel: vel, when: at });
+                const rec = { type, freq, dur, vel, keyChar, rel, at, v, timer: 0 };
+                // 止音仍用定时器，这是有意的：Synth.release(v, rel, when) 会立刻做
+                // held--/混响闸门的簿记，若提前（最多 LOOKAHEAD）调用，混响会在音还没响
+                // 之前就开始收，听感变干。而止音本身是 0.3s 量级的斜坡，几毫秒的定时器
+                // 抖动根本听不出来。
+                //
+                // 延时要**从音头时刻起算**：音符可能在未来 at 才响，从"现在"起算的话
+                // 每个音都会短掉 (at - now) 那么多。
+                const startIn = Math.max(0, (at || Synth.now()) - Synth.now());
+                const holdMs = Math.max(20, (startIn + dur - (rel || 0)) * 1000);
+                rec.timer = setTimeout(function () {
+                    const i = autoVoices.indexOf(rec);
+                    if (i >= 0) autoVoices.splice(i, 1);
+                    // 只释放"还是这个音"的声部：若已被后续同键音符替换、
+                    // 或已被中止流程处理过，则什么都不做。
+                    if (activeVoices[keyChar] === v) {
+                        Synth.release(v);
+                        delete activeVoices[keyChar];
+                    }
+                }, holdMs);
+                autoVoices.push(rec);
+                if (keyChar) activeVoices[keyChar] = v;
+                return rec;
+            }
+
+            // 中止 / 暂停 / 跳转：还没开始响的直接掐掉，已经响着的落止音器
+            function releaseAutoVoices() {
+                autoVoices.slice().forEach(function (rec) {
+                    clearTimeout(rec.timer);
+                    if (Synth.pending(rec.v)) Synth.cut(rec.v);
+                    const i = autoVoices.indexOf(rec);
+                    if (i >= 0) autoVoices.splice(i, 1);
+                });
+                Object.keys(activeVoices).forEach(function (k) {
+                    Synth.release(activeVoices[k]);
+                    delete activeVoices[k];
+                });
+            }
+
+            // 切音色：把还没开始响的声部掐掉，用新音色按原时刻重排一遍。
+            // 已经响着的改不了（换音色等于换振荡器），只能让它自然过去。
+            function revoiceAutoVoices(type) {
+                autoVoices.slice().forEach(function (rec) {
+                    if (!Synth.pending(rec.v)) return;
+                    clearTimeout(rec.timer);
+                    Synth.cut(rec.v);
+                    if (activeVoices[rec.keyChar] === rec.v) delete activeVoices[rec.keyChar];
+                    const i = autoVoices.indexOf(rec);
+                    if (i >= 0) autoVoices.splice(i, 1);
+                    scheduleAutoVoice(type, rec.freq, rec.dur, rec.vel, rec.keyChar,
+                                      rec.rel, rec.at);
+                });
+            }
             
             // 键字符 -> 需要跟着点亮的元素（钢琴键 + 映射表项）。
             // 建一次就够：这些元素在页面里是静态写死的，不会增删。
@@ -3000,38 +3790,13 @@
                         Synth.release(activeVoices[keyChar]);
                         delete activeVoices[keyChar];
                     }
-                    // rel：在拍值结束前多久落止音器（自动演奏专用，见 Score.fire）
-                    const v = Synth.play(currentSoundType, freq, { vel: vel, when: at });
-                    if (keyChar) {
-                        activeVoices[keyChar] = v;
-                        // 止音仍用定时器，这是有意的：Synth.release(v, rel, when) 会
-                        // 立刻做 held--/混响闸门的簿记，若提前（最多 LOOKAHEAD）调用，
-                        // 混响会在音还没响之前就开始收，听感变干。而止音本身是 0.3s
-                        // 量级的斜坡，几毫秒的定时器抖动根本听不出来。
-                        //
-                        // 关键：延时要**从音头时刻起算**。音符可能是在未来 at 才响的
-                        // （fire 最多提前 LOOKAHEAD 排程），若从"现在"起算，每个音都会
-                        // 短掉 (at - now) 那么多。
-                        const startIn = Math.max(0, (at || Synth.now()) - Synth.now());
-                        const holdMs = Math.max(20, (startIn + dur - (rel || 0)) * 1000);
-                        setTimeout(function () {
-                            // 只释放"还是这个音"的声部：若已被后续同键音符
-                            // 替换或已被中止流程释放，则什么都不做。
-                            if (activeVoices[keyChar] === v) {
-                                Synth.release(v);
-                                delete activeVoices[keyChar];
-                            }
-                        }, holdMs);
-                    }
+                    // 自动演奏的声部统一走 scheduleAutoVoice：它记下参数，
+                    // 这样中止时能掐掉"还没开始响"的那批，切音色时能用新音色重排。
+                    scheduleAutoVoice(currentSoundType, freq, dur, vel, keyChar, rel, at);
                 },
                 highlight: highlightKey,
                 unhighlight: removeHighlight,
-                releaseVoices: function () {
-                    Object.keys(activeVoices).forEach(function (k) {
-                        Synth.release(activeVoices[k]);
-                        delete activeVoices[k];
-                    });
-                }
+                releaseVoices: releaseAutoVoices
             });
 
             buildHighlightIndex();
@@ -3174,6 +3939,10 @@
                     currentSoundType = btn.dataset.type;
                     document.getElementById('soundType').textContent = 
                         Synth.names[currentSoundType] || currentSoundType;
+                    // 立刻把"还没开始响"的自动演奏音符换成新音色重排。
+                    // 不做这一步的话要等 LOOKAHEAD 那么久才换过来，
+                    // 听起来就像"切了没反应"。
+                    revoiceAutoVoices(currentSoundType);
                 });
             });
             
