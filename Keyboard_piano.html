@@ -1,7 +1,7 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
+<!-- saved from url=(0073)file:///C:/Users/27109/AppData/Local/Temp/7zO4F1F5FC7/Keyboard_piano.html -->
+<html lang="zh-CN"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>键盘钢琴</title>
     <style>
@@ -484,7 +484,7 @@
         <div class="status-container">
             <div class="status">当前按下：<span id="currentKey">-</span></div>
             <div class="visual-key" id="visualKeyDisplay"></div>
-            <div class="hint">使用键盘上的字母键或点击下方按键演奏音符 · 按 F1 自动演奏《打上花火》（谱子作者：呱呱能有什么坏心思），再按一次中止</div>
+            <div class="hint">使用键盘上的字母键或点击下方按键演奏音符 · 按 F1 自动演奏《打上花火》（谱子作者：呱呱能有什么坏心思），再按一次中止；若笔记本软件劫持了 F1，可用 Shift+S 代替</div>
         </div>
         
         <div class="piano-container">
@@ -712,7 +712,7 @@
     </div>
     
     <div class="footer">
-        <p>键盘钢琴 &copy; 2025 | 使用Web Audio API实现 · 自动演奏曲目：《打上花火》｜谱子作者：呱呱能有什么坏心思（按 F1 演奏）</p>
+        <p>键盘钢琴 © 2025 | 使用Web Audio API实现 · 自动演奏曲目：《打上花火》｜谱子作者：呱呱能有什么坏心思（按 F1 演奏）</p>
     </div>
 
     <script>
@@ -1423,7 +1423,12 @@
                 // hold：长按持续音色一直发声，直到 release() 才淡出
                 if (opts.hold && SUSTAIN[type]) dur = 12;
 
-                const t = ctx.currentTime + 0.02;   // 提前 20ms 排程，避开 JS 时钟抖动
+                // when：把音头排到指定的音频时钟时刻（自动演奏/测试用）；
+                // 不传则提前 20ms 排程，避开 JS 时钟抖动。
+                // 迟到的 when 会被抬到"现在"，不会抛错。
+                const t = (opts.when == null)
+                    ? ctx.currentTime + 0.02
+                    : Math.max(opts.when, ctx.currentTime);
                 const v = builder(freq, dur, opts.vel || 1, t);
                 v.t = t;
                 v.type = type;
@@ -1539,18 +1544,44 @@
          *        · = X/3（三连音/琶音专用）   = X（十六分）
          *        - = 2X（八分）               + = 4X（四分）
          *     未标《数值》时默认 X = 0.2 秒；《》里的数值是 "+" 的停顿秒数。
-         *   · 紧跟在音符后面的延时符号 = 该音按住不放（延音/连音）；
-         *     延时符号落在空隙处 = 休止。
+         *   · 延时符号只表示"等多久再弹下一个音"，**不表示音本身有多长** ——
+         *     字母只表示按下、延时符号只表示等待，格式里没有音长信息。
+         *     所以按住多久是演奏端的选择：见 fire() 里的 holdRatio
+         *     （按住空隙的一半，剩下留成静音，才有断奏而不是一片长音）。
+         *   · 一串连续的延时符号 = 这一段的空隙（含休止），例如 "---" 是三倍时长。
          *   · "#"、汉字数字等转调/额外八度记号无法映射到 21 键，编译时忽略。
          *   · 每一行是一句，空行分段。
-         * TIMELINE 由原始谱面离线编译而来：[键串, 起始秒, 时长秒]（" " 为休止）。
+         * TIMELINE 由原始谱面离线编译而来：[键串, 起始秒, 到下一个音的空隙]（" " 为休止）。
          * ROWS 是同一份谱面的分行显示数据：[键串, 延时符号个数, 重音数]。
          * ============================================================ */
         const Score = (function () {
             'use strict';
 
-            // 谱面编译时采用的基准：X = "=" 的停顿秒数（说明书默认值 0.2）
-            const X_UNIT = 0.2;
+            // TIMELINE 的时间轴是"编译单位"，不是真实秒数。
+            // 真实秒数 = 编译单位 / timeScale()，timeScale() = COMPILE_X / X_UNIT。
+            //
+            // 编译当时把说明书里「《》的值 = "+" 的停顿」误当成了「"=" 的停顿 X」，
+            // 于是整条时间轴被放大了 4 倍（用原谱反推：同一份《打上花火》，
+            // 曲库 MIDI 版 4:27、按说明书语义编译为 4:26，比值 1.00）。
+            // 所以要放回原速，X_UNIT 得取 COMPILE_X 的四分之一 = 0.05。
+            // 想再快一倍就把它减半，想慢就加倍（0.1 就是"半速"，原来就是这个值）。
+            const COMPILE_X = 0.2;   // 编译时采用的单位（"+" 的停顿被当成了 0.2）
+            let X_UNIT = 0.05;       // 当前播放采用的值（可实时调速）
+
+            // 排程窗口：提前这么久把音符挂到音频时钟上。窗口越大越抗卡顿，
+            // 代价是调速/跳转最多要等这么久才生效。
+            const LOOKAHEAD = 1.2;          // 秒（曲内时间）
+            // 迟到容差：音符的音频时刻已经过去超过这么久，就认作"错过"直接跳过。
+            // 这是后台标签页回来的关键 —— 不补发积压的音符，否则会一瞬间糊成一坨。
+            const LATE_TOLERANCE = 0.08;    // 秒（曲内时间）
+            const HEARTBEAT_MS = 250;       // rAF 在后台停摆，用定时器心跳兜底排程
+
+            // 发音时长 = 空隙 × 这个比例（见 fire 里的说明）。
+            // 0.5 与命令行演奏器 lyre_player 的默认值一致；想更连奏就调大、
+            // 更断奏就调小。可在控制台用 Score.setHoldRatio(0.6) 实时改。
+            let holdRatio = 0.5;
+            const HOLD_MIN = 0.03;          // 再短也要有个可闻的音头
+            const HOLD_MAX = 1.0;           // 上限（秒），与演奏器的 max_hold 一致
 
             const TIMELINE = [
 ["VAW",0,1.2],
@@ -2471,21 +2502,33 @@
             let pausedAt = 0;        // 暂停时已播放到的曲内秒数
             let tempoScale = 1;      // 速度倍率（0.5~2）
             let rafId = 0;
+            let heartbeatId = 0;     // 兜底排程心跳（见 pump/heartbeat）
             let nextIdx = 0;         // 下一个待触发的音符
-            let activeCells = [];    // 当前正在发声的显示单元（含跨小节延音）
+            let activeCells = [];    // 当前挂着的显示定时器
             let currentLine = -1;
             let playheadEl = null, cellsWrap = null, barEl = null, statusEl = null;
             let toneCb = null, highlightCb = null, unhighlightCb = null;
+            let releaseVoicesCb = null;  // 中止/暂停时止音正在延续的自动演奏音符
+            let CELL_BY_ID = [];     // 事件序号 -> 显示格（建一次，避免每次全表扫描）
+            let LINE_START = [];     // 行 -> 该行首音的曲内秒数（用 TIMELINE 算，单位才对）
+
+            // 谱面时间轴（编译时按 X = COMPILE_X 生成）到实际播放时间的换算：
+            //   倍率 = COMPILE_X / X_UNIT；X_UNIT 越小，实际播放越快。
+            function timeScale() { return COMPILE_X / X_UNIT * tempoScale; }
 
             function curPos() {
                 if (state !== 'playing') return pausedAt;
-                return (Synth.now() - startCtxTime) * tempoScale;
+                return (Synth.now() - startCtxTime) * timeScale();
             }
 
             function totalBeats() {
                 const last = TIMELINE[TIMELINE.length - 1];
                 return last[1] + last[2];
             }
+
+            // 曲内秒数 -> 音频时钟时刻（与 curPos 互为逆运算）。
+            // 音头就挂在这个时刻上，所以不受 setTimeout 抖动与后台节流影响。
+            function audioTimeOf(scoreSec) { return startCtxTime + scoreSec / timeScale(); }
 
             /* ---- 渲染谱面（隐藏容器，仅供播放头/格子点亮逻辑使用）---- */
             function buildDOM() {
@@ -2494,6 +2537,8 @@
                 container.setAttribute('aria-hidden', 'true');
                 // 页面 UI 不展示谱子内容：整棵谱面树离屏隐藏
                 container.style.cssText = 'position:fixed;left:-99999px;top:0;width:1px;height:1px;overflow:hidden;pointer-events:none;';
+                CELL_BY_ID = [];
+                let cursor = 0;      // 与 TIMELINE 的顺序一一对应
                 ROWS.forEach(function (row, li) {
                     const line = document.createElement('div');
                     line.className = 'score-line';
@@ -2520,113 +2565,104 @@
                             span.appendChild(p);
                         }
                         line.appendChild(span);
+                        const ev = TIMELINE[cursor];
+                        if (ev) CELL_BY_ID[ev._id] = span;   // 建一次表，点亮时 O(1) 取
+                        cursor++;
                     });
                     container.appendChild(line);
                 });
+                if (cursor !== TIMELINE.length) {
+                    console.warn('[自动演奏] 谱面显示格数与时间轴事件数不一致：' +
+                                 cursor + ' vs ' + TIMELINE.length + '，格子点亮可能错位');
+                }
                 document.body.appendChild(container);
                 playheadEl = container;
                 cellsWrap = container;
             }
 
             /* ---- 调度 ---- */
-            function scheduleFrom(posSec) {
-                // 找到 posSec 之后（含正在延续的）音符并全部重新挂上定时器
-                const now = Synth.now();
-                activeCells.forEach(function (a) { clearTimeout(a.timer); });
-                activeCells = [];
-                nextIdx = 0;
+            //
+            // 两条职责分开，别再混在一起：
+            //   · 发声 —— 音头直接写进音频时钟（Synth.play 的 when），
+            //     误差由音频线程保证，与 JS 定时器抖动、后台节流都无关。
+            //   · 视觉 —— 用普通 setTimeout 大致对点就行，抖动看不出来。
+            // pump() 只往前推进 nextIdx，可以放心地被反复调用（rAF + 心跳 + 调速）。
+            function pump() {
+                const pos = curPos();
+                const ts = timeScale();
                 while (nextIdx < TIMELINE.length &&
-                       TIMELINE[nextIdx][1] + TIMELINE[nextIdx][2] <= posSec) {
-                    nextIdx++;
+                       (TIMELINE[nextIdx][1] - pos) / ts <= LOOKAHEAD) {
+                    const ev = TIMELINE[nextIdx++];
+                    // 已经错过的音符直接跳过，不补发 —— 否则后台回来的一瞬间，
+                    // 积压的几百个音会全部以"现在"为时刻发出来，糊成一坨。
+                    if (ev[1] < pos - LATE_TOLERANCE) continue;
+                    fire(ev, audioTimeOf(ev[1]));
                 }
-                let i = nextIdx;
-                while (i < TIMELINE.length && TIMELINE[i][1] < posSec) {
-                    // 正在延续中的音符（延音跨过当前位置）：只补视觉，不重触发
-                    i++;
-                }
-                nextIdx = Math.max(nextIdx, i);
-                // 从 nextIdx 起按绝对时间批量排程（lookahead 之外的用 setTimeout）
-                let scheduled = 0;
-                for (let j = nextIdx; j < TIMELINE.length; j++) {
-                    const ev = TIMELINE[j];
-                    const delay = ((ev[1] - posSec) / tempoScale) * 1000;
-                    if (delay > 1500) break;              // 剩下的交给 tick 循环
-                    (function (e, d) {
-                        const timer = setTimeout(function () { trigger(e); }, d);
-                        activeCells.push({ ev: e, timer: timer });
-                        scheduled++;
-                    })(ev, Math.max(0, delay));
-                }
-                if (scheduled > 0) nextIdx += scheduled;
             }
 
-            function trigger(ev) {
-                const keys = ev[0], dur = ev[2];
+            function scheduleFrom(posSec) {
+                // 从 posSec 处（重新）开始：丢掉所有定时器，再从头定位。
+                stopTimers();
+                nextIdx = 0;
+                // 已经开始过的音符一律不重触发（含正跨过 posSec 的那一个长音）；
+                // 它是延音，恢复播放时从头再触发会多出一次重复起音。
+                while (nextIdx < TIMELINE.length && TIMELINE[nextIdx][1] < posSec) {
+                    nextIdx++;
+                }
+                pump();
+            }
+
+            function fire(ev, at) {
+                const keys = ev[0];
                 if (!keys || keys === ' ') return;   // 休止：不发声、不高亮
+                // ev[2] 是"到下一个音的空隙"，单位是编译单位，换算成真实秒数要
+                // **除以** timeScale（和排程里的 (ev[1]-pos)/timeScale 同一个方向）。
+                // 原来写成乘 —— 于是"按住时长"被放大 4 倍（声明 4.8 秒、实际空隙
+                // 只有 0.6 秒），每个音都盖住后面四个音，听起来就是一片长音。
+                const ts = timeScale();
+                const dur = ev[2] / ts;
+                // 空隙里只有一部分是音，其余留成静音，才有断奏而不是连成一片。
+                // 规则与命令行演奏器 lyre_player 一致：clamp(空隙 × 比例, 下限, 上限)。
+                const hold = Math.min(HOLD_MAX, Math.max(HOLD_MIN, dur * holdRatio));
+                const rel = dur - hold;      // 拍值结束前多久落止音器
                 const vel = 0.85;
+                // 1) 发声：音头挂在音频时钟的 at 上
                 for (let k = 0; k < keys.length; k++) {
                     const f = FREQ[keys[k]];
                     if (!f) continue;
-                    if (toneCb) toneCb(f, dur, vel, keys[k]);
-                    if (highlightCb) highlightCb(keys[k].toLowerCase());
+                    if (toneCb) toneCb(f, dur, vel, keys[k], rel, at);
                 }
-                // 点亮谱面上对应的格子
-                markCell(ev, true);
-                const t = setTimeout(function () {
+                // 2) 视觉：等到大致到点再点亮，亮多久跟实际发音时长一致
+                const delayMs = Math.max(0, (at - Synth.now()) * 1000);
+                const t1 = setTimeout(function () {
+                    for (let k = 0; k < keys.length; k++) {
+                        if (highlightCb) highlightCb(keys[k].toLowerCase());
+                    }
+                    markCell(ev, true);
+                }, delayMs);
+                const t2 = setTimeout(function () {
                     for (let k = 0; k < keys.length; k++) {
                         if (unhighlightCb) unhighlightCb(keys[k].toLowerCase());
                     }
                     markCell(ev, false);
-                }, Math.min(dur, 0.9) / tempoScale * 1000);
-                activeCells.push({ ev: ev, timer: t });
+                }, delayMs + hold * 1000);
+                activeCells.push({ timer: t1 }, { timer: t2 });
             }
 
-            function findCellNode(ev) {
-                // TIMELINE 事件与 ROWS 单元格一一对应（顺序遍历即可定位）
-                let count = -1;
-                for (let li = 0; li < ROWS.length; li++) {
-                    for (let ci = 0; ci < ROWS[li].length; ci++) {
-                        if (ROWS[li][ci] === '|') continue;
-                        count++;
-                        if (count === ev._id) {
-                            const lineEl = playheadEl.children[li];
-                            const cellEls = lineEl.querySelectorAll('.score-cell');
-                            return cellEls[localIndex(li, ev._id)];
-                        }
-                    }
-                }
-                return null;
-            }
-
-            function localIndex(li, id) {
-                let before = 0;
-                for (let l = 0; l < li; l++) {
-                    before += ROWS[l].filter(function (c) { return c !== '|'; }).length;
-                }
-                return id - before;
-            }
-
+            // 点亮/熄灭显示格：直接查 buildDOM 建好的表。
+            // （原来是每次全表扫描 752 个格子找 _id，每个音符还要再跑两次
+            //   全量 querySelectorAll('.key') + forEach —— 纯浪费，谱面还是隐藏的。）
             function markCell(ev, on) {
-                const node = findCellNode(ev);
+                const node = CELL_BY_ID[ev._id];
                 if (node) node.classList.toggle('playing', on);
             }
 
-            /* ---- 主循环：lookahead 排程 + 进度/滚动跟随 ---- */
+            /* ---- 主循环：排程 + 进度/行跟随 ---- */
             function tick() {
                 if (state !== 'playing') return;
+                pump();                        // 排程未来 LOOKAHEAD 内的音符
                 const pos = curPos();
                 const total = totalBeats();
-                // 排程未来 1.5 秒内的音符
-                while (nextIdx < TIMELINE.length &&
-                       (TIMELINE[nextIdx][1] - pos) / tempoScale <= 1.5) {
-                    const ev = TIMELINE[nextIdx];
-                    const delay = Math.max(0, (ev[1] - pos) / tempoScale * 1000);
-                    (function (e, d) {
-                        const timer = setTimeout(function () { trigger(e); }, d);
-                        activeCells.push({ ev: e, timer: timer });
-                    })(ev, delay);
-                    nextIdx++;
-                }
                 // 进度条
                 if (barEl) barEl.style.width = Math.min(100, pos / total * 100) + '%';
                 // 当前行高亮（谱面为隐藏容器，scrollIntoView 对离屏元素无副作用）
@@ -2648,26 +2684,55 @@
                 rafId = requestAnimationFrame(tick);
             }
 
-            function lineOfPos(pos) {
-                let acc = 0;
+            // rAF 在后台标签页会完全停摆，只靠它就等于"切走就不再排程"。
+            // 本页一直在发声，属于浏览器的"可闻标签页"，定时器不会被重罚，
+            // 所以用心跳兜底；排程本身是幂等的（pump 只推进 nextIdx）。
+            function heartbeat() {
+                if (state !== 'playing') return;
+                pump();
+                heartbeatId = setTimeout(heartbeat, HEARTBEAT_MS);
+            }
+
+            // 行 -> 曲内秒数。原来是把 ROWS 里的"延时符号个数"当成秒来累加
+            // （第一行 8 格 × 3 = 24，而它实际只有 9.6 秒），单位不对，行高亮必然错位。
+            // 现在直接用 TIMELINE 的行首音起点，顺带省掉每帧 752 次求和。
+            function buildLineBounds() {
+                LINE_START = [];
+                let evIndex = 0;
                 for (let li = 0; li < ROWS.length; li++) {
-                    let beats = 0;
-                    ROWS[li].forEach(function (c) { if (c !== '|') beats += c[1]; });
-                    if (pos < acc + beats) return li;
-                    acc += beats;
+                    LINE_START.push(evIndex < TIMELINE.length
+                        ? TIMELINE[evIndex][1] : Infinity);
+                    let n = 0;
+                    ROWS[li].forEach(function (c) { if (c !== '|') n++; });
+                    evIndex += n;
                 }
-                return ROWS.length - 1;
+            }
+
+            function lineOfPos(pos) {
+                let found = 0;
+                for (let li = 0; li < LINE_START.length; li++) {
+                    if (LINE_START[li] <= pos) found = li;
+                    else break;
+                }
+                return found;
             }
 
             /* ---- 控制 ---- */
             function play() {
                 // 首次触发时解锁音频上下文（F1 也是用户手势）
-                Synth.unlock();
+                const ctx = Synth.unlock();
                 if (state === 'playing') return;
                 if (state === 'done' || state === 'idle') pausedAt = 0;
-                startCtxTime = Synth.now() - pausedAt / tempoScale;
+                // 注意：ctx.currentTime 在 resume() 之前会冻结，必须先把它推进到
+                // "现在"再取起点；否则 startCtxTime 落在过去，前几个音会被浏览器
+                // 当作过期事件全部瞬间触发（听起来像按了没反应或直接炸一坨）。
+                const t0 = Math.max(ctx ? ctx.currentTime : 0, Synth.now());
+                startCtxTime = t0 - pausedAt / timeScale();
                 state = 'playing';
                 scheduleFrom(pausedAt);
+                // 心跳兜底：rAF 在后台会停摆，这个继续把音符挂上音频时钟
+                clearTimeout(heartbeatId);
+                heartbeatId = setTimeout(heartbeat, HEARTBEAT_MS);
                 setStatus('正在演奏');
                 tick();
             }
@@ -2704,13 +2769,26 @@
 
             function stopTimers() {
                 cancelAnimationFrame(rafId);
+                clearTimeout(heartbeatId);
+                heartbeatId = 0;
                 activeCells.forEach(function (a) { clearTimeout(a.timer); });
                 activeCells = [];
             }
 
-            function clearHighlights() {
-                const nodes = cellsWrap ? cellsWrap.querySelectorAll('.score-cell.playing') : [];
+            // 只擦掉谱面上的点亮标记，不碰正在发声的音符
+            function clearVisualMarks() {
+                if (!cellsWrap) return;
+                const nodes = cellsWrap.querySelectorAll('.score-cell.playing');
                 for (let i = 0; i < nodes.length; i++) nodes[i].classList.remove('playing');
+            }
+
+            function clearHighlights() {
+                clearVisualMarks();
+                // 止音当前仍在发声的自动演奏音符：抬键抑制音尾（止音器），
+                // 否则中止后琴声还会拖着长尾巴继续响一阵。
+                if (releaseVoicesCb) {
+                    releaseVoicesCb();
+                }
                 if (unhighlightCb) {
                     Object.keys(FREQ).forEach(function (k) {
                         unhighlightCb(k.toLowerCase());
@@ -2725,8 +2803,14 @@
                 tempoScale = mult;
                 pausedAt = pos;
                 if (wasPlaying) {
-                    startCtxTime = Synth.now() - pos / tempoScale;
+                    // 只擦显示标记：调速不该把正在响的音掐掉（那是 clearHighlights 的事）
+                    clearVisualMarks();
+                    startCtxTime = Synth.now() - pos / timeScale();
+                    // 注意：已经挂上音频时钟的音头仍按旧速度走完（最多 LOOKAHEAD 那么久），
+                    // 之后的音符按新速度排 —— 改 LOOKAHEAD 会同时改这个延迟。
                     scheduleFrom(pos);
+                    clearTimeout(heartbeatId);
+                    heartbeatId = setTimeout(heartbeat, HEARTBEAT_MS);
                     tick();
                 }
                 setStatus(state === 'playing' ? '正在演奏' :
@@ -2740,7 +2824,7 @@
                 clearHighlights();
                 pausedAt = pos;
                 if (wasPlaying) {
-                    startCtxTime = Synth.now() - pos / tempoScale;
+                    startCtxTime = Synth.now() - pos / timeScale();
                     scheduleFrom(pos);
                     tick();
                 } else if (state !== 'idle') {
@@ -2753,17 +2837,41 @@
             }
 
             function init() {
+                // _id 必须先分配：buildDOM 要用它建 CELL_BY_ID 查表
+                TIMELINE.forEach(function (ev, i) { ev._id = i; });
                 // 页面 UI 不显示谱子内容：不接任何可见 DOM，只搭好隐藏谱面树
                 buildDOM();
-                // 给每个时间轴事件编号（用于定位显示格）
-                TIMELINE.forEach(function (ev, i) { ev._id = i; });
+                buildLineBounds();
+            }
+
+            // 接线自动演奏回调（发声/高亮）。必须在 play() 之前设置，否则
+            // fire() 里 toneCb/highlightCb 为 null —— 无声、无按键点亮。
+            function setCallbacks(cb) {
+                if (cb.tone) toneCb = cb.tone;
+                if (cb.highlight) highlightCb = cb.highlight;
+                if (cb.unhighlight) unhighlightCb = cb.unhighlight;
+                if (cb.releaseVoices) releaseVoicesCb = cb.releaseVoices;
             }
 
             return {
                 init: init,
+                setCallbacks: setCallbacks,
                 play: play,
                 pause: pause,
                 stop: stop,
+                // 下面几个原先只定义没导出，页面里拿不到（也就没法做暂停/调速/拖进度）。
+                // 现在一并交出来，接 UI 时直接调即可。
+                setTempo: setTempo,
+                getTempo: function () { return tempoScale; },
+                // 发音时长比例（按住空隙的百分比）。命令行演奏器用的是 0.5。
+                setHoldRatio: function (r) {
+                    if (typeof r === 'number' && r > 0 && r <= 1) holdRatio = r;
+                    return holdRatio;
+                },
+                getHoldRatio: function () { return holdRatio; },
+                seekToRatio: seekToRatio,
+                getPosition: function () { return curPos(); },
+                getDuration: function () { return totalBeats(); },
                 isPlaying: function () { return state === 'playing'; },
                 getState: function () { return state; }
             };
@@ -2795,40 +2903,37 @@
                 return Synth.play(currentSoundType, freq);
             }
             
-            // 高亮按键
+            // 键字符 -> 需要跟着点亮的元素（钢琴键 + 映射表项）。
+            // 建一次就够：这些元素在页面里是静态写死的，不会增删。
+            // 原来每个音符都要跑两次全量 querySelectorAll('.key') 加两轮 forEach
+            // （自动演奏时每秒好几个音符），纯属白烧，抖动量还会叠到音头排程上。
+            const HIGHLIGHT_ELS = {};
+            function buildHighlightIndex() {
+                document.querySelectorAll('.key').forEach(function (el) {
+                    const n = el.dataset.note;
+                    if (!n) return;
+                    (HIGHLIGHT_ELS[n] = HIGHLIGHT_ELS[n] || []).push(el);
+                });
+                keyMapItems.forEach(function (el) {
+                    const n = el.dataset.note;
+                    if (!n) return;
+                    (HIGHLIGHT_ELS[n] = HIGHLIGHT_ELS[n] || []).push(el);
+                });
+            }
+            function toggleHighlight(keyChar, on) {
+                const els = HIGHLIGHT_ELS[keyChar];
+                if (!els) return;
+                for (let i = 0; i < els.length; i++) els[i].classList.toggle('active', on);
+            }
+            
+            // 高亮按键（含映射表项）
             function highlightKey(keyChar) {
-                // 高亮钢琴键
-                const keys = document.querySelectorAll('.key');
-                keys.forEach(key => {
-                    if (key.dataset.note === keyChar) {
-                        key.classList.add('active');
-                    }
-                });
-                
-                // 高亮映射表项
-                keyMapItems.forEach(item => {
-                    if (item.dataset.note === keyChar) {
-                        item.classList.add('active');
-                    }
-                });
+                toggleHighlight(keyChar, true);
             }
             
             // 移除高亮
             function removeHighlight(keyChar) {
-                // 移除钢琴键高亮
-                const keys = document.querySelectorAll('.key');
-                keys.forEach(key => {
-                    if (key.dataset.note === keyChar) {
-                        key.classList.remove('active');
-                    }
-                });
-                
-                // 移除映射表项高亮
-                keyMapItems.forEach(item => {
-                    if (item.dataset.note === keyChar) {
-                        item.classList.remove('active');
-                    }
-                });
+                toggleHighlight(keyChar, false);
             }
             
             // 播放音符
@@ -2882,33 +2987,98 @@
                 }
             }
             
-            // 自动演奏：按下琴键时直接抑制正在延续的音尾（止音器），再播新音
-            toneCb = function (freq, dur, vel, keyChar) {
-                if (keyChar && activeVoices[keyChar]) {
-                    Synth.release(activeVoices[keyChar]);
-                    delete activeVoices[keyChar];
-                }
-                const v = Synth.play(currentSoundType, freq, vel);
-                if (keyChar) activeVoices[keyChar] = v;
-            };
-            highlightCb = highlightKey;
-            unhighlightCb = removeHighlight;
-
-            Score.init();
-
-            // F1 切换自动演奏：开始播放《打上花火》，再按一次中止
-            document.addEventListener('keydown', (e) => {
-                if (e.key !== 'F1') return;
-                e.preventDefault();
-                if (Score.isPlaying()) {
-                    Score.stop();
-                } else {
-                    Score.play();
+            // 自动演奏回调接线：必须通过 Score.setCallbacks() 交进去。
+            // （toneCb/highlightCb/unhighlightCb 是 Score IIFE 的私有变量，
+            //   在这里裸赋值只是在闭包外新建了同名全局变量，Score.fire()
+            //   里的私有回调始终是 null —— 这就是之前 F1 能捕获、状态切换正常，
+            //   但无声、无按键点亮的根因。）
+            Score.setCallbacks({
+                // at：Score 排好的音频时刻（见 Score.fire）。音头直接交给音频时钟，
+                // 误差由音频线程保证，不再受 JS 定时器抖动影响。
+                tone: function (freq, dur, vel, keyChar, rel, at) {
+                    if (keyChar && activeVoices[keyChar]) {
+                        Synth.release(activeVoices[keyChar]);
+                        delete activeVoices[keyChar];
+                    }
+                    // rel：在拍值结束前多久落止音器（自动演奏专用，见 Score.fire）
+                    const v = Synth.play(currentSoundType, freq, { vel: vel, when: at });
+                    if (keyChar) {
+                        activeVoices[keyChar] = v;
+                        // 止音仍用定时器，这是有意的：Synth.release(v, rel, when) 会
+                        // 立刻做 held--/混响闸门的簿记，若提前（最多 LOOKAHEAD）调用，
+                        // 混响会在音还没响之前就开始收，听感变干。而止音本身是 0.3s
+                        // 量级的斜坡，几毫秒的定时器抖动根本听不出来。
+                        //
+                        // 关键：延时要**从音头时刻起算**。音符可能是在未来 at 才响的
+                        // （fire 最多提前 LOOKAHEAD 排程），若从"现在"起算，每个音都会
+                        // 短掉 (at - now) 那么多。
+                        const startIn = Math.max(0, (at || Synth.now()) - Synth.now());
+                        const holdMs = Math.max(20, (startIn + dur - (rel || 0)) * 1000);
+                        setTimeout(function () {
+                            // 只释放"还是这个音"的声部：若已被后续同键音符
+                            // 替换或已被中止流程释放，则什么都不做。
+                            if (activeVoices[keyChar] === v) {
+                                Synth.release(v);
+                                delete activeVoices[keyChar];
+                            }
+                        }, holdMs);
+                    }
+                },
+                highlight: highlightKey,
+                unhighlight: removeHighlight,
+                releaseVoices: function () {
+                    Object.keys(activeVoices).forEach(function (k) {
+                        Synth.release(activeVoices[k]);
+                        delete activeVoices[k];
+                    });
                 }
             });
 
-            // 主按键事件处理
-            document.addEventListener('keydown', (e) => {
+            buildHighlightIndex();
+            Score.init();
+
+            // F1 切换自动演奏：开始播放《打上花火》，再按一次中止。
+            // 监听挂在 window 的捕获阶段：F1 在 Chrome/Edge/Firefox 里会被浏览器
+            // 保留（打开帮助页），页面级冒泡监听经常收不到或被吞掉；捕获阶段 +
+            // preventDefault 是最稳的接法。另外部分笔记本（联想 Vantage、罗技
+            // Gaming Software 等）会劫持 F1，那种情况本页面无法拦截，可用下方
+            // 兜底键位代替。
+            function toggleScore() {
+                try {
+                    if (Score.isPlaying()) {
+                        Score.stop();
+                        const st = document.getElementById('currentKey');
+                        if (st) st.textContent = '-';   // 视觉反馈：已中止
+                    } else {
+                        Score.play();
+                        const st = document.getElementById('currentKey');
+                        if (st) st.textContent = '♪';   // 视觉反馈：演奏中
+                    }
+                } catch (err) {
+                    console.error('[自动演奏] 启动失败:', err);
+                    const st = document.getElementById('currentKey');
+                    if (st) st.textContent = '!';
+                }
+            }
+            window.addEventListener('keydown', (e) => {
+                if (e.key !== 'F1') return;
+                e.preventDefault();
+                e.stopPropagation();
+                toggleScore();
+            }, true);
+
+            // 兜底快捷键：Shift+S（不受功能键劫持影响）
+            window.addEventListener('keydown', (e) => {
+                if (e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey &&
+                    e.code === 'KeyS') {
+                    e.preventDefault();
+                    toggleScore();
+                }
+            }, true);
+
+            // 主按键事件处理（挂在 window 冒泡阶段：F1/Shift+S 的捕获监听里
+            // stopPropagation 之后，本处理器就收不到那两次按键，不会误触发 s 键音符）
+            window.addEventListener('keydown', (e) => {
                 const key = e.key.toLowerCase();
                 const validKeys = ['q','w','e','r','t','y','u','a','s','d','f','g','h','j','z','x','c','v','b','n','m'];
                 
@@ -2918,7 +3088,7 @@
                 }
             });
             
-            document.addEventListener('keyup', (e) => {
+            window.addEventListener('keyup', (e) => {
                 const key = e.key.toLowerCase();
                 const validKeys = ['q','w','e','r','t','y','u','a','s','d','f','g','h','j','z','x','c','v','b','n','m'];
                 
@@ -3019,5 +3189,5 @@
             }, false);
         });
     </script>
-</body>
-</html>
+
+</body></html>
