@@ -490,17 +490,38 @@
                 piano: 0.10, rhodes: 0.12, guitar: 0.09, musicbox: 0.13,
                 strings: 0.20, flute: 0.15, chip: 0.06, organ: 0.12, sine: 0.08
             };
-            // 各音色默认发声时长（秒）
+            // 各音色默认发声时长（秒）。
+            // 注意：这里的 dur 是"一次击弦后自然衰减到无声"的寿命，不是"按住能响多久"。
+            // 打击类音色（钢琴/电钢琴/吉他/八音盒）的真实行为是：击弦瞬间决定音量，
+            // 之后弦自己按物理规律指数衰减；手指按住并不会延长它，抬键只是让止音器
+            // 提前落回弦上、把衰减加速。所以持续类音色才需要 hold 延长寿命，
+            // 打击类音色的 dur 要足够长，才能做到"按住长时仍然听得到音尾"。
             const DUR = {
-                piano: 3.2, sine: 1.6, organ: 1.4, rhodes: 1.8, guitar: 2.0,
-                musicbox: 2.2, strings: 2.0, flute: 1.8, chip: 1.6
+                piano: 5.0, sine: 1.6, organ: 1.4, rhodes: 4.5, guitar: 4.0,
+                musicbox: 4.4, strings: 2.0, flute: 1.8, chip: 1.6
             };
+            // 止音（抬键加速衰减）的参数。现实调查结论：
+            //   · 击弦类（钢琴/Rhodes/吉他/八音盒）按住并不延长发音，弦自己按
+            //     "先快后慢"的两段指数自由衰减；抬键只是让止音器落回弦上，
+            //     把剩余尾音加速到约 3 倍速走完。
+            //   · 真实止音器从离开弦到完全压住约 0.2~0.4 秒，所以止音动作本身
+            //     必须持续这么久才像"消音"；短于它就是电子门的咔哒急停。
+            //   · 持续类（风琴/弦乐/长笛/8-bit/正弦）按住是持平发声，不存在
+            //     "加速衰减"，松手就是一次普通的释放淡出（见 DAMP 表）。
+            //   · 右踏板（延音）抬起时止音器整体缓慢回落，消音明显更慢。
+            const PEDAL_REL = 1.6;  // 延音踏板踩着时的止音淡出（止音器随踏板缓慢回落）
+            const REL_MIN = 0.30;   // 止音最短时长：真止音器落下消音约 0.2~0.4s，
+                                    // 比这更短听起来就是"掐断"而不是"加速衰减"
 
             let ctx = null, master = null, revBus = null, revGate = null, noiseBuf = null;
             let held = 0;          // 还没被抬键抑制掉的发声单元个数
             let pulseCache = null;
             const ksCache = new Map();
             const BUILD = {};
+            // 延音踏板状态（空格按住）：踩下期间抬指只记时刻、不止音；
+            // 松开踏板时统一把"踏板期间抬过指、还没止过音"的声部落下来。
+            // 这是钢琴右踏板的真实行为——止音器由踏板整体控制。
+            let pedalD = 0;
 
             /* ---------------- 基础设施 ---------------- */
 
@@ -658,12 +679,93 @@
                     damper.connect(revNode);
                     revNode.connect(revBus);
                 }
-                return { out: out, damper: damper, revNode: revNode, srcs: [], cap: 1, decayDb: 0 };
+                return { out: out, damper: damper, revNode: revNode, srcs: [], cap: 1,
+                         decayDb: 0, envs: [] };
+            }
+
+            /* ---- 分段贝塞尔自然衰减包络（本次修正的核心）----
+             * 调查结论：真实弦鸣乐器（钢琴/Rhodes/吉他/八音盒）的自由衰减几乎都是
+             * "两段式"——先是快的初始段（泛音与敲击瞬态先跑掉），随后转入一条长得
+             * 多的慢尾（基模衰减）。用一条 cubic bezier 描述整条包络：
+             *     P0=(0,pk)  P1=(xa·dur, ya·pk)  P2=(xb·dur, yb·pk)  P3=(dur, 0)
+             * xa/ya 决定拐点位置（初始段吃掉多少时间/电平），xb 让尾部平缓弯向零。
+             *
+             * buildEnvelope() 把它采样成两张表：
+             *     lv —— 电平表（release() 之外也可复用）
+             *     db/k —— 相对峰值的 dB 与该处斜率 dB/s
+             * 抬键时不再依赖某个"登记死的长尾斜率"，而是按**已按住的时长**去查
+             * 此刻真实的电平和斜率，再据此配止音速度——这就是原来"总匹配不好
+             * 时间"的病根：快断奏时音处在很陡的第一段，固定 rel 只摊到 ~1.7 倍速，
+             * 听不出止音；慢连奏时音早已落到可闻阈以下，任何尾巴都毫无意义。
+             */
+            function bezierY(x, xa, ya, xb, yb) {
+                // 求解 u 使 X(u)=x：X(u)=3(1-u)²u·xa + 3(1-u)u²·xb + u³（单调递增）
+                let lo = 0, hi = 1;
+                for (let i = 0; i < 24; i++) {
+                    const m = (lo + hi) / 2, im = 1 - m;
+                    const xv = 3 * im * im * m * xa + 3 * im * m * m * xb + m * m * m;
+                    if (xv < x) lo = m; else hi = m;
+                }
+                const u = (lo + hi) / 2, iu = 1 - u;
+                return 3 * iu * iu * u * ya + 3 * iu * u * u * yb;
+            }
+
+            function buildEnvelope(o) {
+                // o = {dur, peak, atk, xa, ya, xb, yb}
+                const N = 512;
+                const dur = o.dur, pk = o.peak;
+                const xa = o.xa, ya = o.ya,
+                      xb = o.xb == null ? 0.85 : o.xb, yb = o.yb == null ? 0 : o.yb;
+                const lv = new Float32Array(N + 1);
+                for (let i = 0; i <= N; i++) lv[i] = pk * bezierY(i / N, xa, ya, xb, yb);
+                lv[0] = pk; lv[N] = 0;
+                const db = new Float32Array(N + 1), k = new Float32Array(N + 1);
+                const dt = dur / N;
+                for (let i = 0; i <= N; i++) {
+                    db[i] = 20 * Math.log10(Math.max(lv[i], 1e-9) / pk);   // ≤0
+                }
+                for (let i = 0; i <= N; i++) {
+                    const i0 = Math.max(0, i - 1), i1 = Math.min(N, i + 1);
+                    k[i] = (db[i1] - db[i0]) / ((i1 - i0) * dt);            // 负值 dB/s
+                }
+                return { lv: lv, db: db, k: k, dt: dt, N: N, pk: pk, dur: dur, atk: o.atk || 0 };
+            }
+
+            // 把包络排到 GainNode 上（起音 linearRamp 之后紧接着调用）。
+            // 自动化点全部排在 [tRef, tRef+dur]，之后的平台由调用方自己锚定，
+            // 所以按住多久都不会"提前死掉"——音只是沿自然衰减越来越轻。
+            function scheduleEnvelope(param, v, e, tRef) {
+                const STEP = 0.1;                     // 每 100ms 一个插值点，指数足够平滑
+                const N = e.N;
+                for (let x = 0; x <= e.dur + 1e-9; x += STEP) {
+                    const i = Math.min(N, Math.round(x / e.dt));
+                    param.linearRampToValueAtTime(Math.max(e.lv[i], EPS), tRef + Math.min(x, e.dur));
+                    if (i >= N) break;
+                }
+                param.setValueAtTime(EPS, tRef + e.dur);
+                e.tRef = tRef;                        // 查表基准时刻
+                v.envs.push(e);
+            }
+
+            // 在绝对时刻 t 查包络状态：{db: 相对峰值 dB(≤0), k: 斜率 dB/s(<0), done}
+            function envAt(e, t) {
+                const x = t - e.tRef;
+                if (x < 0) return { db: 0, k: e.k[1], done: false };
+                if (x >= e.dur) return { db: -999, k: 0, done: true };
+                const i = Math.min(e.N - 1, Math.floor(x / e.dt)), f = x / e.dt - i;
+                return {
+                    db: e.db[i] + (e.db[i + 1] - e.db[i]) * f,
+                    k: Math.min(e.k[i], -1),          // 至少 1 dB/s，防除零
+                    done: false
+                };
             }
 
             /* ---------------- 各音色 ---------------- */
 
-            // 钢琴：锯齿波 + 正弦基音 + 低频滤波器（保留原有实现与参数）
+            // 钢琴：锯齿波 + 正弦基音 + 低频滤波器。
+            // 自然衰减按调查结论做成"两段式"贝塞尔（前 ~13% 时间快掉到 42%，
+            // 之后转慢尾直到 dur）。整条包络排成自动化点，按住多久都只是越来越轻，
+            // 不会在中途"断气"；抬键时再查此刻的电平/斜率来配止音速度。
             BUILD.piano = function (freq, dur, vel, t) {
                 const v = newVoice(0.10);
                 const mainOsc = osc('sawtooth', freq);
@@ -675,16 +777,12 @@
                 filter.frequency.value = 2000;
                 filter.Q.value = 1;
                 const mainGain = ctx.createGain();
+                const PK = Math.max(0.3 * vel, EPS);
                 mainGain.gain.setValueAtTime(0, t);
-                mainGain.gain.linearRampToValueAtTime(0.3, t + 0.02);
-                // 真实钢琴是两段衰减：击弦后先快掉一段（泛音先跑掉），再拖一条长尾。
-                // 原来是一条指数从 0.15 直落 EPS（1.4s，约 -45dB/s），按住不放 1 秒
-                // 就掉到 -47dB 了 —— 松手时根本没剩下可听的东西，再加速 3 倍自然是"没声"。
-                mainGain.gain.exponentialRampToValueAtTime(0.075, t + 0.5);
-                mainGain.gain.exponentialRampToValueAtTime(EPS, t + dur);
-                mainGain.gain.setValueAtTime(0, t + dur);
-                // 登记长尾段的速率（约 -21dB/s），抬键加速按这个算
-                v.decayDb = 20 * Math.log10(0.075 / EPS) / Math.max(dur - 0.5, 0.05);
+                mainGain.gain.linearRampToValueAtTime(PK, t + 0.02);
+                scheduleEnvelope(mainGain.gain, v,
+                    buildEnvelope({ dur: dur - 0.02, peak: PK, atk: 0.02,
+                                    xa: 0.12, ya: 0.42, xb: 0.82, yb: 0 }), t + 0.02);
                 const subGain = gain(0.2);
                 lfo.connect(lfoGain).connect(mainOsc.detune);
                 mainOsc.connect(filter);
@@ -700,12 +798,12 @@
             BUILD.rhodes = function (freq, dur, vel, t) {
                 const v = newVoice(0.22);
                 const layers = [
-                    // [倍频, 调制指数, 调制衰减, 层音量, 音体衰减, 保持比例]
-                    [1.0, 2.2 * vel, 0.90, 0.34, 1.6, 0.10],
-                    [14.0, 1.4 * vel, 0.10, 0.06, 0.55, 0.0]
+                    // [倍频, 调制指数, 调制衰减, 层音量, 自然衰减总时长, 拐点位置, 拐点电平]
+                    [1.0, 2.2 * vel, 0.90, 0.34, Math.min(dur, 4.5), 0.10, 0.50],
+                    [14.0, 1.4 * vel, 0.10, 0.06, 0.90, 0.30, 0.30]
                 ];
-                // 电钢琴有延长音，实测衰减很慢：音体层 1.6s 内从峰值衰到 10%
-                v.decayDb = 20 * Math.log10(1 / Math.max(layers[0][5], 1e-3)) / Math.max(layers[0][4], 0.01);
+                // 调查结论：Rhodes 的 tine 振动带延长音，峰值以下 -20dB 约需 1.6s
+                // （≈12.5 dB/s），比钢琴慢得多；前段是敲击瞬态的快速跌落。
 
                 for (let i = 0; i < layers.length; i++) {
                     const L = layers[i];
@@ -717,7 +815,12 @@
                     mod.connect(modGain).connect(car.frequency);
                     const layer = ctx.createGain();
                     car.connect(layer).connect(v.out);
-                    env(layer.gain, t, { a: 0.003, d: L[4], s: L[5], r: 0.55, peak: L[3], tOff: t + dur });
+                    const PK = Math.max(L[3], EPS);
+                    layer.gain.setValueAtTime(0, t);
+                    layer.gain.linearRampToValueAtTime(PK, t + 0.003);
+                    scheduleEnvelope(layer.gain, v,
+                        buildEnvelope({ dur: L[4], peak: PK, atk: 0.003,
+                                        xa: L[5], ya: L[6], xb: 0.85, yb: 0 }), t + 0.003);
                     v.srcs.push(mod, car);
                 }
                 v.cap = dur + 0.9;
@@ -807,9 +910,21 @@
             BUILD.guitar = function (freq, dur, vel, t) {
                 const v = newVoice(0.16);
                 const src = ctx.createBufferSource();
-                const ks = ksBuffer(freq, Math.min(dur + 0.6, 3.2), 0.9985, 0.58);
+                const ks = ksBuffer(freq, Math.min(dur + 0.6, 4.8), 0.9985, 0.58);
                 src.buffer = ks.buf;
-                v.decayDb = ks.decayDb;
+                // KS 波形自带自然衰减（decayDb 是逐音实测的 dB/s）。这里再登记一条
+                // 同速率的贝塞尔包络，只为让 release() 知道"此刻还剩多少可听的音"，
+                // 止音时长据此封顶；实际发声的电平由 Buffer 本身决定。
+                const kk = Math.max(ks.decayDb, 2);              // dB/s
+                const audT = 46 / kk;                            // 峰值以下 -46dB ≈ 听不见
+                const eDur = Math.min(Math.max(audT, 0.4), dur + 0.6);
+                const PK = Math.max(0.5 * vel, EPS);
+                const g = v.out.gain;
+                g.setValueAtTime(0, t);
+                g.linearRampToValueAtTime(PK, t + 0.004);
+                scheduleEnvelope(g, v,
+                    buildEnvelope({ dur: eDur, peak: PK, atk: 0.004,
+                                    xa: 0.10, ya: 0.45, xb: 0.85, yb: 0 }), t + 0.004);
                 const hp = ctx.createBiquadFilter();          // 去掉过低的闷响
                 hp.type = 'highpass';
                 hp.frequency.value = 75;
@@ -822,12 +937,6 @@
                 tone.type = 'lowpass';
                 tone.frequency.value = 4200;
                 tone.Q.value = 0.6;
-                const g = v.out.gain;
-                g.setValueAtTime(0, t);
-                g.linearRampToValueAtTime(0.5 * vel, t + 0.004);
-                g.setValueAtTime(0.5 * vel, t + dur);
-                g.exponentialRampToValueAtTime(EPS, t + dur + 0.09);
-                g.setValueAtTime(0, t + dur + 0.09);
                 src.connect(hp).connect(body).connect(tone).connect(v.out);
                 v.srcs.push(src);
                 v.cap = dur + 0.15;
@@ -857,10 +966,19 @@
                     o.detune.value = p[3];
                     const g = ctx.createGain();
                     const dec = p[2] * scale;
+                    const PK = Math.max(p[1] * LV, EPS);
                     g.gain.setValueAtTime(0, t);
-                    g.gain.linearRampToValueAtTime(p[1] * LV, t + atk);
-                    g.gain.exponentialRampToValueAtTime(EPS, t + atk + dec);
-                    g.gain.setValueAtTime(0, t + atk + dec);
+                    g.gain.linearRampToValueAtTime(PK, t + atk);
+                    if (i === 0) {
+                        // 基音那条登记进包络表，release() 查的就是它：
+                        // 金属音梳的泛音各自衰减，高的先掉，基模拖最长的"叮——"尾。
+                        scheduleEnvelope(g.gain, v,
+                            buildEnvelope({ dur: dec, peak: PK, atk: atk,
+                                            xa: 0.10, ya: 0.40, xb: 0.85, yb: 0 }), t + atk);
+                    } else {
+                        g.gain.exponentialRampToValueAtTime(EPS, t + atk + dec);
+                        g.gain.setValueAtTime(0, t + atk + dec);
+                    }
                     o.connect(g).connect(hp);
                     v.srcs.push(o);
                     if (atk + dec > end) end = atk + dec;
@@ -879,8 +997,6 @@
                 nb.connect(nhp).connect(ng).connect(hp);
                 v.srcs.push(nb);
 
-                // 基音在 2.2*scale 秒内从 LV 衰到 EPS
-                v.decayDb = 20 * Math.log10(LV / EPS) / Math.max(2.2 * scale, 0.05);
                 v.cap = end + 0.1;
                 return v;
             };
@@ -1079,29 +1195,53 @@
                 return v;
             }
 
-            // 抬键止音：不是把音尾掐掉，而是让衰减加速到约 3 倍再走完。
+            // 抬键止音：不是把音尾掐掉，而是让"此刻剩余的音"加速到约 3 倍速走完。
             //
             // damper 与乐器自身的衰减是相乘关系，速率相加：
             //     松手后总速率 = k(乐器) + k_d(止音器)，要它等于 3k，则 k_d = 2k
-            //     => damper 从 1 衰到 EPS 用 80/(2k) = 40/k 秒（80dB 是 1 到 EPS 的跨度）
-            // k 由各音色自己登记在 decayDb 上（单位 dB/s），因为它们的自然衰减速率
-            // 相差很远：钢琴约 45 dB/s，电钢琴有延长音只有 12.5 dB/s。用固定系数
-            // 推不出统一的 3 倍，实测会跑成 6 倍（又变回接近急停）。
+            //     => 抬键瞬间还剩 db dB（相对峰值，负值）没走完，damper 就用
+            //        t = db / (2k) 秒把它压到底（见下面的实现）
             //
-            // 持续类音色没有自然衰减（k=0），"3 倍速"无从谈起，退回 DAMP 表的释放淡出。
+            // 关键修正一：k 与 db 都不再取"各音色登记的一条固定长尾斜率"，而是按
+            // **已按住的时长**去包络表里查抬键瞬间的真实值 envAt()。真实弦鸣乐器
+            // 的自由衰减是两段式的（先陡后缓），固定参数必然两头对不上：断奏时音
+            // 还在陡的第一段、只剩几 dB 可听，固定 rel 却拖成 1.6 秒（听感＝没止音）；
+            // 慢连奏时音早已落到可闻阈以下，任何尾巴都毫无意义——这正是原来
+            // "时间总匹配不好"的病根。
+            //
+            // 关键修正二：上下限把止音动作钉在真止音器的量级（REL_MIN=0.3s 起，
+            // 最多 4×REL_MIN）。短于下限就是电子门咔哒急停，长于上限就等于没止音。
+            //
+            // 持续类音色没有自然衰减（envs 为空），"3 倍速"无从谈起，
+            // 退回 DAMP 表的普通释放淡出。
             function release(v, rel, when) {
                 if (!v || v.released) return;
                 v.released = true;
 
-                // when 可把释放排到将来的某个时刻（测试、自动演奏、将来的踏板功能都用得上）
+                // when 可把释放排到将来的某个时刻（测试、自动演奏、踏板功能都用得上）
                 const at = Math.max(when == null ? ctx.currentTime : when, v.t + 0.04);
                 if (rel == null) {
-                    // 40/decayDb 秒正是"总速率 = 3k"所需的 damper 时长。
-                    // 下限 0.3s 是保险：若某个音色衰减极快，3 倍后只剩不到 0.3 秒，
-                    // 那听起来就是一声咔哒而不是"加速的尾音"，此时宁可比 3 倍再慢一点。
-                    rel = v.decayDb > 0
-                        ? Math.max(40 / v.decayDb, 0.3)
-                        : (DAMP[v.type] == null ? 0.12 : DAMP[v.type]);
+                    if (v.envs && v.envs.length) {
+                        // 多层的音色（Rhodes 有两层）以"此刻还剩最多可发音"的那层为准
+                        let st = null;
+                        for (let i = 0; i < v.envs.length; i++) {
+                            const s = envAt(v.envs[i], at);
+                            if (!s.done && (st === null || s.db > st.db)) st = s;
+                        }
+                        if (!st) {
+                            rel = REL_MIN;          // 已经自然衰减完：走个最短消音即可
+                        } else {
+                            // 让 damper 恰好覆盖"剩余电平按 3 倍速落到静音"的时间。
+                            // 用 -db/(2|k|) 而不是 40/|k|：后者是 damper 自身走完 80dB
+                            // 的时长，与此刻还剩多少无关——于是断奏时明明只剩 6dB 可听，
+                            // 止音却拖成 1.6 秒（听感＝没止音），这正是原来对不上时间的
+                            // 另一半病根。上限 REL_MIN*4：真止音器落下约 0.2~0.4s，
+                            // 再慢就不是"加速衰减"而是放任自由衰减了。
+                            rel = Math.min(Math.max(20 / (-2 * st.k), REL_MIN), REL_MIN * 4);
+                        }
+                    } else {
+                        rel = DAMP[v.type] == null ? 0.12 : DAMP[v.type];
+                    }
                 }
 
                 const g = v.damper.gain;
@@ -1186,7 +1326,9 @@
                 activeVoices[key] = Synth.play(currentSoundType, freq, { hold: true });
             }
             
-            // 停止特定键的音符（仅对可持续音色有效，打击类音色会自行衰减完）
+            // 停止特定键的音符：抬键就抑制音尾（模拟止音器）。
+            // 持续类音色是一次普通释放淡出；打击类音色则由 Synth.release() 按
+            // 抬键瞬间的真实电平/斜率算出止音时长（约 0.3s 量级的加速消音）。
             function stopTone(key) {
                 if (activeVoices[key]) {
                     Synth.release(activeVoices[key]);
@@ -1227,7 +1369,7 @@
                     }
                 });
                 
-                // 停止声音（打击类音色不在 activeVoices 里，stopTone 会自动跳过）
+                // 抬键止音：所有音色都在 activeVoices 里记了账，交给引擎处理
                 stopTone(key);
             }
             
@@ -1348,7 +1490,9 @@
             // 切到别的窗口时把还按着的音都收掉。keyup 是收不到的，不收的话
             // 持续音色会一直响下去，混响闸门也会一直开着。
             window.addEventListener('blur', () => {
-                Object.keys(activeVoices).forEach(key => stopNote(key));
+                Object.keys(activeVoices).forEach(key => stopTone(key));
+                document.querySelectorAll('.key.active, .numpad-key.active')
+                    .forEach(el => el.classList.remove('active'));
             });
             
             // 添加触摸设备支持
