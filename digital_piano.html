@@ -265,10 +265,12 @@
             display: flex;
             justify-content: space-between;
             align-items: center;
+            flex-wrap: wrap;
             margin-top: 15px;
             padding: 10px;
             background: rgba(255, 215, 0, 0.1);
             border-radius: 8px;
+            gap: 8px;
         }
         
         .sound-type {
@@ -276,19 +278,24 @@
             color: #ffd700;
         }
         
+        /* 9 个音色排成整齐的 3x3 方块，窄容器下也不会出现孤零零的折行 */
         .sound-controls {
-            display: flex;
-            gap: 10px;
+            display: grid;
+            grid-template-columns: repeat(3, auto);
+            justify-content: center;
+            gap: 6px;
         }
         
         .sound-btn {
             background: rgba(255, 255, 255, 0.1);
             border: 1px solid rgba(255, 215, 0, 0.3);
             color: #ffd700;
-            padding: 6px 12px;
+            padding: 4px 9px;
             border-radius: 5px;
             cursor: pointer;
             transition: all 0.3s;
+            font-size: 0.9rem;
+            white-space: nowrap;
         }
         
         .sound-btn.active {
@@ -390,8 +397,14 @@
                     <div class="sound-type">当前音色: <span id="soundType">钢琴</span></div>
                     <div class="sound-controls">
                         <div class="sound-btn active" data-type="piano">钢琴</div>
-                        <div class="sound-btn" data-type="sine">正弦波</div>
+                        <div class="sound-btn" data-type="rhodes">电钢琴</div>
+                        <div class="sound-btn" data-type="guitar">吉他</div>
+                        <div class="sound-btn" data-type="musicbox">八音盒</div>
+                        <div class="sound-btn" data-type="strings">弦乐</div>
+                        <div class="sound-btn" data-type="flute">长笛</div>
+                        <div class="sound-btn" data-type="chip">8-bit</div>
                         <div class="sound-btn" data-type="organ">风琴</div>
+                        <div class="sound-btn" data-type="sine">正弦波</div>
                     </div>
                 </div>
             </div>
@@ -434,7 +447,7 @@
             <p><strong>使用说明：</strong> 请确保您的键盘有数字小键盘区域。按下小键盘上的按键可以演奏不同音高的音符，同时钢琴键盘和小键盘上的对应按键会高亮显示。</p>
             <p><strong>音阶顺序：</strong> 0 . Enter 1 2 3 4 5 6 7 8 9 + / * - (从低到高)</p>
             <p><strong>音阶间隔：</strong> 符合自然音阶规律（C大调）</p>
-            <p><strong>音色选择：</strong> 您可以在钢琴键盘上方选择不同的音色（钢琴、正弦波、风琴）</p>
+            <p><strong>音色选择：</strong> 您可以在钢琴键盘上方选择不同的音色（钢琴、电钢琴、吉他、八音盒、弦乐、长笛、8-bit、风琴、正弦波）；其中弦乐、长笛等可持续音色长按会一直发声，抬键时才淡出</p>
             <p><strong>音符对应：</strong> 
                 <br>0: A3 (220.00Hz) | .: B3 (246.94Hz) | Enter: C4 (261.63Hz)
                 <br>1: D4 (293.66Hz) | 2: E4 (329.63Hz) | 3: F4 (349.23Hz)
@@ -442,7 +455,7 @@
                 <br>7: C5 (523.25Hz) | 8: D5 (587.33Hz) | 9: E5 (659.26Hz)
                 <br>+: F5 (698.46Hz) | /: G5 (783.99Hz) | *: A5 (880.00Hz) | -: B5 (987.77Hz)
             </p>
-            <p><strong>按键行为：</strong> 长按按键只会播放一次声音，短按会播放完整音符</p>
+            <p><strong>按键行为：</strong> 打击类音色（钢琴、电钢琴、吉他、八音盒）按一次响一次并自然衰减；持续类音色（弦乐、长笛、8-bit、风琴、正弦波）按住会一直发声，松手时淡出</p>
         </div>
     </div>
     
@@ -451,11 +464,581 @@
     </div>
 
     <script>
+        /* ============================================================
+         * Web Audio 合成引擎（纯合成，不依赖任何音频文件）
+         * 音色：钢琴 / 电钢琴 / 吉他 / 八音盒 / 弦乐 / 长笛 / 8-bit / 风琴 / 正弦波
+         *
+         * 由 OscillatorNode / AudioBufferSourceNode（运行时生成波形）+ 滤波器
+         * + 增益包络 + 卷积混响（运行时生成脉冲响应）构成，无外部依赖。
+         * ============================================================ */
+        const Synth = (function () {
+            'use strict';
+
+            const EPS = 1e-4;   // 指数曲线不能到 0，用极小值代替
+
+            const NAMES = {
+                piano: '钢琴', rhodes: '电钢琴', guitar: '吉他', musicbox: '八音盒',
+                strings: '弦乐', flute: '长笛', chip: '8-bit', organ: '风琴', sine: '正弦波'
+            };
+            // 长按可持续的音色（松开时淡出），其余为一次性衰减音色
+            const SUSTAIN = { sine: 1, organ: 1, strings: 1, flute: 1, chip: 1 };
+            // 各音色默认发声时长（秒）
+            const DUR = {
+                piano: 1.5, sine: 1.6, organ: 1.4, rhodes: 1.8, guitar: 2.0,
+                musicbox: 2.2, strings: 2.0, flute: 1.8, chip: 1.6
+            };
+
+            let ctx = null, master = null, revBus = null, noiseBuf = null;
+            let pulseCache = null;
+            const ksCache = new Map();
+            const BUILD = {};
+
+            /* ---------------- 基础设施 ---------------- */
+
+            // 运行时生成混响脉冲响应：白噪声 × 指数衰减
+            function makeIR(seconds, decay) {
+                const n = Math.max(1, Math.floor(ctx.sampleRate * seconds));
+                const buf = ctx.createBuffer(2, n, ctx.sampleRate);
+                for (let ch = 0; ch < 2; ch++) {
+                    const d = buf.getChannelData(ch);
+                    for (let i = 0; i < n; i++) {
+                        d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / n, decay);
+                    }
+                }
+                return buf;
+            }
+
+            function getNoise() {
+                if (!noiseBuf || noiseBuf.sampleRate !== ctx.sampleRate) {
+                    const n = Math.floor(ctx.sampleRate * 2);
+                    noiseBuf = ctx.createBuffer(1, n, ctx.sampleRate);
+                    const d = noiseBuf.getChannelData(0);
+                    for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+                }
+                return noiseBuf;
+            }
+
+            function noiseSource(loop) {
+                const s = ctx.createBufferSource();
+                s.buffer = getNoise();
+                s.loop = !!loop;
+                return s;
+            }
+
+            function osc(type, freq) {
+                const o = ctx.createOscillator();
+                o.type = type;
+                o.frequency.value = freq;
+                return o;
+            }
+
+            function gain(value) {
+                const g = ctx.createGain();
+                g.gain.value = value;
+                return g;
+            }
+
+            // 可变占空比脉冲波（8-bit 音色的 NES 风格 12.5%/25%/50%）
+            function pulseWave(duty, harm) {
+                harm = harm || 32;
+                const real = new Float32Array(harm + 1);
+                const imag = new Float32Array(harm + 1);
+                for (let i = 1; i <= harm; i++) {
+                    real[i] = (4 / (i * Math.PI)) * Math.sin(i * Math.PI * duty);
+                }
+                return ctx.createPeriodicWave(real, imag);
+            }
+
+            function pulseWaves() {
+                if (!pulseCache || pulseCache.sr !== ctx.sampleRate) {
+                    pulseCache = {
+                        sr: ctx.sampleRate,
+                        w: { 0.125: pulseWave(0.125), 0.25: pulseWave(0.25), 0.5: pulseWave(0.5) }
+                    };
+                }
+                return pulseCache.w;
+            }
+
+            // 位压缩曲线（WaveShaperNode 用，模拟 8-bit 量化）
+            function crushCurve(levels) {
+                const n = 1024, c = new Float32Array(n);
+                for (let i = 0; i < n; i++) {
+                    const x = (i / (n - 1)) * 2 - 1;
+                    c[i] = Math.round(x * levels) / levels;
+                }
+                return c;
+            }
+
+            // 振幅包络：起音 - 衰减 - 保持 - 释放
+            function env(param, t, o) {
+                const a = o.a, d = o.d, s = o.s, r = o.r, peak = o.peak;
+                const tOff = Math.max(o.tOff, t + a + d);
+                const sus = Math.max(peak * s, EPS);
+                param.cancelScheduledValues(t);
+                param.setValueAtTime(0, t);
+                param.linearRampToValueAtTime(peak, t + a);
+                param.exponentialRampToValueAtTime(sus, t + a + d);
+                if (tOff > t + a + d) param.setValueAtTime(sus, tOff);
+                param.exponentialRampToValueAtTime(EPS, tOff + r);
+                param.setValueAtTime(0, tOff + r);
+                return tOff + r;
+            }
+
+            // 打击型包络：起音后指数衰减到静音
+            function perc(param, t, decay, peak, a) {
+                a = a || 0.002;
+                param.cancelScheduledValues(t);
+                param.setValueAtTime(0, t);
+                param.linearRampToValueAtTime(peak, t + a);
+                param.exponentialRampToValueAtTime(EPS, t + a + decay);
+                param.setValueAtTime(0, t + a + decay);
+                return t + a + decay;
+            }
+
+            // 颤音 LFO，depth 单位为音分（cents）
+            function vibrato(target, t, rate, cents, delay) {
+                const lfo = osc('sine', rate);
+                const g = ctx.createGain();
+                g.gain.setValueAtTime(0, t);
+                g.gain.linearRampToValueAtTime(cents, t + delay + 0.15);
+                lfo.connect(g).connect(target);
+                return lfo;
+            }
+
+            // 一个音符的公共输出节点；wet 为送入混响的湿声比例
+            function newVoice(wet) {
+                const out = ctx.createGain();
+                out.gain.value = 1;
+                out.connect(master);
+                let revNode = null;
+                if (wet) {
+                    revNode = gain(wet);
+                    out.connect(revNode);
+                    revNode.connect(revBus);
+                }
+                return { out: out, revNode: revNode, srcs: [], cap: 1 };
+            }
+
+            /* ---------------- 各音色 ---------------- */
+
+            // 钢琴：锯齿波 + 正弦基音 + 低频滤波器（保留原有实现与参数）
+            BUILD.piano = function (freq, dur, vel, t) {
+                const v = newVoice(0.10);
+                const mainOsc = osc('sawtooth', freq);
+                const subOsc = osc('sine', freq);
+                const lfo = osc('sine', 5);
+                const lfoGain = gain(0.8);
+                const filter = ctx.createBiquadFilter();
+                filter.type = 'lowpass';
+                filter.frequency.value = 2000;
+                filter.Q.value = 1;
+                const mainGain = ctx.createGain();
+                mainGain.gain.setValueAtTime(0, t);
+                mainGain.gain.linearRampToValueAtTime(0.3, t + 0.02);
+                mainGain.gain.exponentialRampToValueAtTime(0.15, t + 0.1);
+                mainGain.gain.exponentialRampToValueAtTime(EPS, t + dur);
+                mainGain.gain.setValueAtTime(0, t + dur);
+                const subGain = gain(0.2);
+                lfo.connect(lfoGain).connect(mainOsc.detune);
+                mainOsc.connect(filter);
+                subOsc.connect(subGain).connect(filter);
+                filter.connect(mainGain).connect(v.out);
+                v.srcs.push(mainOsc, subOsc, lfo);
+                v.cap = dur + 0.1;
+                return v;
+            };
+
+            // 电钢琴：两算子 FM。音体层 ratio 1.0，音叉层 ratio 14 且调制指数快速衰减，
+            // 得到「金属敲击瞬态 → 温暖余韵」的 Rhodes 音色。
+            BUILD.rhodes = function (freq, dur, vel, t) {
+                const v = newVoice(0.22);
+                const layers = [
+                    // [倍频, 调制指数, 调制衰减, 层音量, 音体衰减, 保持比例]
+                    [1.0, 2.2 * vel, 0.90, 0.34, 1.6, 0.10],
+                    [14.0, 1.4 * vel, 0.10, 0.06, 0.55, 0.0]
+                ];
+                for (let i = 0; i < layers.length; i++) {
+                    const L = layers[i];
+                    const car = osc('sine', freq);
+                    const mod = osc('sine', freq * L[0]);
+                    const modGain = ctx.createGain();
+                    modGain.gain.setValueAtTime(Math.max(L[1] * freq * L[0], EPS), t);
+                    modGain.gain.exponentialRampToValueAtTime(EPS, t + L[2]);
+                    mod.connect(modGain).connect(car.frequency);
+                    const layer = ctx.createGain();
+                    car.connect(layer).connect(v.out);
+                    env(layer.gain, t, { a: 0.003, d: L[4], s: L[5], r: 0.55, peak: L[3], tOff: t + dur });
+                    v.srcs.push(mod, car);
+                }
+                v.cap = dur + 0.9;
+                return v;
+            };
+
+            // 吉他：Karplus-Strong 拨弦。先在 JS 里跑完递推生成波形，再当 BufferSource 播放，
+            // 避免 DelayNode 在反馈回路里被强制到 128 帧（高音会跑调）。
+            function ksBuffer(freq, seconds, damp, brightness) {
+                const key = ctx.sampleRate + '|' + freq.toFixed(2) + '|' + damp + '|' + brightness;
+                const hit = ksCache.get(key);
+                if (hit) return hit;
+
+                const sr = ctx.sampleRate;
+                const N = Math.max(2, Math.round(sr / freq - 0.5));   // 0.5 采样补偿环路相位延迟
+                const len = Math.max(1, Math.floor(sr * seconds));
+                const buf = ctx.createBuffer(1, len, sr);
+                const data = buf.getChannelData(0);
+                const ring = new Float32Array(N);
+
+                // 激励：经过一阶低通的白噪声（brightness 越大越亮）
+                let z = 0;
+                for (let i = 0; i < N; i++) {
+                    const w = Math.random() * 2 - 1;
+                    z = brightness * w + (1 - brightness) * z;
+                    ring[i] = z;
+                }
+                // 去掉激励的直流分量。噪声脉冲的均值每次都不一样，
+                // 留着会让滤波后的实际响度飘忽（听感上就是同一个音忽大忽小）
+                let mean = 0;
+                for (let i = 0; i < N; i++) mean += ring[i];
+                mean /= N;
+                for (let i = 0; i < N; i++) ring[i] -= mean;
+
+                // 递推：y[n] = x[n] + damp * 0.5 * (y[n-N] + y[n-N-1])
+                // 两点平均滤波器在高频处衰减，正是真实的弦阻尼（高次泛音先消失）
+                let idx = 0, prev = ring[N - 1];
+                for (let i = 0; i < len; i++) {
+                    const cur = ring[idx];
+                    data[i] = cur;
+                    ring[idx] = damp * 0.5 * (cur + prev);
+                    prev = cur;
+                    idx = (idx + 1) % N;
+                }
+
+                // 按 RMS 归一化。噪声激励的「峰值」每次随机抖动很大，用它归一化会让
+                // 同一个音的音量忽大忽小；RMS 稳定得多，也更贴近听感响度。
+                // 只统计拨弦后的头 0.3 秒——KS 的能量几乎都在这一段，
+                // 用整段算会被漫长的衰减尾巴稀释，反而衡量不出实际响度。
+                const head = Math.min(len, Math.floor(ctx.sampleRate * 0.3));
+                let sumSq = 0;
+                for (let i = 0; i < head; i++) sumSq += data[i] * data[i];
+                const headRms = Math.sqrt(sumSq / head);
+                if (headRms > 0) {
+                    const k = 0.3 / headRms;
+                    for (let i = 0; i < len; i++) data[i] *= k;
+                    let pk = 0;
+                    for (let i = 0; i < len; i++) {
+                        const a = Math.abs(data[i]);
+                        if (a > pk) pk = a;
+                    }
+                    if (pk > 1) {
+                        for (let i = 0; i < len; i++) data[i] /= pk;
+                    }
+                }
+
+                ksCache.set(key, buf);
+                return buf;
+            }
+
+            BUILD.guitar = function (freq, dur, vel, t) {
+                const v = newVoice(0.16);
+                const src = ctx.createBufferSource();
+                src.buffer = ksBuffer(freq, Math.min(dur + 0.6, 3.2), 0.9985, 0.58);
+                const hp = ctx.createBiquadFilter();          // 去掉过低的闷响
+                hp.type = 'highpass';
+                hp.frequency.value = 75;
+                const body = ctx.createBiquadFilter();        // 琴箱共鸣
+                body.type = 'peaking';
+                body.frequency.value = 205;
+                body.Q.value = 1;
+                body.gain.value = 4;
+                const tone = ctx.createBiquadFilter();        // 抑制噪声爆音的毛刺
+                tone.type = 'lowpass';
+                tone.frequency.value = 4200;
+                tone.Q.value = 0.6;
+                const g = v.out.gain;
+                g.setValueAtTime(0, t);
+                g.linearRampToValueAtTime(0.5 * vel, t + 0.004);
+                g.setValueAtTime(0.5 * vel, t + dur);
+                g.exponentialRampToValueAtTime(EPS, t + dur + 0.09);
+                g.setValueAtTime(0, t + dur + 0.09);
+                src.connect(hp).connect(body).connect(tone).connect(v.out);
+                v.srcs.push(src);
+                v.cap = dur + 0.15;
+                return v;
+            };
+
+            // 八音盒：非谐泛音（1 : 2 : 3.01 : 5.43 : 8.10）叠加，高次泛音先衰减，
+            // 第三个泛音加 4 音分失谐制造金属颤动感。
+            BUILD.musicbox = function (freq, dur, vel, t) {
+                const v = newVoice(0.34);
+                const hp = ctx.createBiquadFilter();          // 去掉箱体的浑浊低频
+                hp.type = 'highpass';
+                hp.frequency.value = 250;
+                hp.Q.value = 0.6;
+                hp.connect(v.out);
+
+                const parts = [
+                    // [倍频, 音量, 衰减秒数, 失谐音分]
+                    [1.0, 1.00, 2.2, 0], [2.0, 0.45, 1.3, 0],
+                    [3.01, 0.30, 0.9, 4], [5.43, 0.16, 0.45, 0], [8.10, 0.08, 0.22, 0]
+                ];
+                const atk = 0.0015, scale = dur / 2.2, LV = 0.26;
+                let end = 0;
+                for (let i = 0; i < parts.length; i++) {
+                    const p = parts[i];
+                    const o = osc('sine', freq * p[0]);
+                    o.detune.value = p[3];
+                    const g = ctx.createGain();
+                    const dec = p[2] * scale;
+                    g.gain.setValueAtTime(0, t);
+                    g.gain.linearRampToValueAtTime(p[1] * LV, t + atk);
+                    g.gain.exponentialRampToValueAtTime(EPS, t + atk + dec);
+                    g.gain.setValueAtTime(0, t + atk + dec);
+                    o.connect(g).connect(hp);
+                    v.srcs.push(o);
+                    if (atk + dec > end) end = atk + dec;
+                }
+
+                // 上弦的敲击瞬态
+                const nb = noiseSource(false);
+                const nhp = ctx.createBiquadFilter();
+                nhp.type = 'highpass';
+                nhp.frequency.value = 5000;
+                const ng = ctx.createGain();
+                ng.gain.setValueAtTime(0, t);
+                ng.gain.linearRampToValueAtTime(0.09, t + 0.0008);
+                ng.gain.exponentialRampToValueAtTime(EPS, t + 0.006);
+                ng.gain.setValueAtTime(0, t + 0.007);
+                nb.connect(nhp).connect(ng).connect(hp);
+                v.srcs.push(nb);
+
+                v.cap = end + 0.1;
+                return v;
+            };
+
+            // 弦乐：五把失谐锯齿（-14/-7/+3/+9/+16 音分）+ 低八度锯齿，
+            // 低通截止频率先冲高再回落，形成「渐强泛音」的弓弦感。
+            BUILD.strings = function (freq, dur, vel, t) {
+                const v = newVoice(0.30);
+                const lp = ctx.createBiquadFilter();
+                lp.type = 'lowpass';
+                lp.Q.value = 0.7;
+                lp.frequency.setValueAtTime(freq * 1.5 + 200, t);
+                lp.frequency.exponentialRampToValueAtTime(Math.min(freq * 6 + 2200, 9000), t + 0.9);
+                lp.frequency.exponentialRampToValueAtTime(Math.min(freq * 3 + 900, 5000), t + 1.5);
+                lp.connect(v.out);
+
+                const detunes = [-14, -7, 3, 9, 16];
+                for (let i = 0; i < detunes.length; i++) {
+                    const o = osc('sawtooth', freq);
+                    o.detune.value = detunes[i];
+                    o.connect(gain(0.22)).connect(lp);
+                    v.srcs.push(o);
+                }
+                const sub = osc('sawtooth', freq / 2);
+                sub.connect(gain(0.28)).connect(lp);
+                v.srcs.push(sub);
+
+                env(v.out.gain, t, { a: 0.35, d: 0.3, s: 0.85, r: 1.2, peak: 0.34, tOff: t + dur });
+                v.cap = dur + 1.4;
+                return v;
+            };
+
+            // 长笛：正弦基音 + 一点二次谐波，叠加带通白噪声模拟吹气声，
+            // 缓慢起音 + 延迟进入的颤音，是可持续音色。
+            BUILD.flute = function (freq, dur, vel, t) {
+                const v = newVoice(0.26);
+                const bodyLP = ctx.createBiquadFilter();
+                bodyLP.type = 'lowpass';
+                bodyLP.Q.value = 0.7;
+                bodyLP.frequency.value = freq * 3 + 900;
+                bodyLP.connect(v.out);
+
+                const tone = osc('sine', freq);
+                tone.connect(gain(1)).connect(bodyLP);
+                const h2 = osc('sine', freq * 2);
+                h2.connect(gain(0.1)).connect(bodyLP);
+
+                const nb = noiseSource(true);
+                const bp = ctx.createBiquadFilter();
+                bp.type = 'bandpass';
+                bp.Q.value = 1.4;
+                bp.frequency.value = freq * 2.2;
+                const bg = ctx.createGain();
+                bg.gain.setValueAtTime(0, t);
+                bg.gain.linearRampToValueAtTime(0.2, t + 0.07);   // 起音时更「有气息」
+                bg.gain.exponentialRampToValueAtTime(0.1, t + 0.25);
+                bg.gain.setValueAtTime(0.1, t + dur);
+                bg.gain.exponentialRampToValueAtTime(EPS, t + dur + 0.16);
+                bg.gain.setValueAtTime(0, t + dur + 0.16);
+                nb.connect(bp).connect(bg).connect(v.out);
+
+                env(v.out.gain, t, { a: 0.075, d: 0.18, s: 0.85, r: 0.16, peak: 0.40, tOff: t + dur });
+                v.srcs.push(tone, h2, nb, vibrato(tone.detune, t, 5.2, 9, 0.18));
+                v.cap = dur + 0.5;
+                return v;
+            };
+
+            // 8-bit：12.5% 占空比脉冲波 + 位压缩，带轻微颤音
+            BUILD.chip = function (freq, dur, vel, t) {
+                const v = newVoice(0.16);
+                const o = ctx.createOscillator();
+                o.setPeriodicWave(pulseWaves()[0.125]);
+                o.frequency.value = freq;
+                const ws = ctx.createWaveShaper();
+                ws.curve = crushCurve(8);
+                ws.oversample = '2x';
+                o.connect(ws).connect(v.out);
+                env(v.out.gain, t, { a: 0.001, d: 0.06, s: 0.7, r: 0.04, peak: 0.22, tOff: t + dur });
+                v.srcs.push(o, vibrato(o.detune, t, 7, 14, 0.12));
+                v.cap = dur + 0.1;
+                return v;
+            };
+
+            // 风琴：三个正弦谐波叠加（保留原有实现与参数）
+            BUILD.organ = function (freq, dur, vel, t) {
+                const v = newVoice(0.12);
+                const levels = [0.3, 0.2, 0.15];
+                const mainGain = ctx.createGain();
+                mainGain.gain.setValueAtTime(0, t);
+                mainGain.gain.linearRampToValueAtTime(0.4, t + 0.1);
+                mainGain.gain.exponentialRampToValueAtTime(EPS, t + dur);
+                mainGain.gain.setValueAtTime(0, t + dur);
+                for (let i = 0; i < 3; i++) {
+                    const o = osc('sine', freq * (i + 1));
+                    o.connect(gain(levels[i])).connect(mainGain);
+                    v.srcs.push(o);
+                }
+                mainGain.connect(v.out);
+                v.cap = dur + 0.1;
+                return v;
+            };
+
+            // 正弦波：纯正弦，起音/释放都极短
+            BUILD.sine = function (freq, dur, vel, t) {
+                const v = newVoice(0.08);
+                const o = osc('sine', freq);
+                const g = ctx.createGain();
+                o.connect(g).connect(v.out);
+                g.gain.setValueAtTime(0, t);
+                g.gain.linearRampToValueAtTime(0.12, t + 0.01);
+                g.gain.setValueAtTime(0.12, t + dur);
+                g.gain.exponentialRampToValueAtTime(EPS, t + dur + 0.12);
+                g.gain.setValueAtTime(0, t + dur + 0.12);
+                v.srcs.push(o);
+                v.cap = dur + 0.2;
+                return v;
+            };
+
+            /* ---------------- 对外接口 ---------------- */
+
+            function init() {
+                if (ctx) return ctx;
+                if (!(window.AudioContext || window.webkitAudioContext)) {
+                    throw new Error('Web Audio API 不可用');
+                }
+                ctx = new (window.AudioContext || window.webkitAudioContext)();
+
+                // 主总线：总音量 -> 压缩器 -> 输出。
+                // 压缩器只是防止多音叠加削波的保险，单音电平时几乎不介入。
+                master = ctx.createGain();
+                master.gain.value = 1;
+                const comp = ctx.createDynamicsCompressor();
+                comp.threshold.value = -6;
+                comp.knee.value = 10;
+                comp.ratio.value = 6;
+                comp.attack.value = 0.003;
+                comp.release.value = 0.25;
+                master.connect(comp);
+                comp.connect(ctx.destination);
+
+                // 混响总线（脉冲响应运行时生成，仍然不依赖音频文件）
+                revBus = ctx.createGain();
+                const conv = ctx.createConvolver();
+                conv.buffer = makeIR(2.6, 3.0);
+                revBus.connect(conv);
+                conv.connect(gain(0.55)).connect(master);
+
+                getNoise();
+                return ctx;
+            }
+
+            // 在用户手势里调用，解锁被浏览器挂起的音频上下文
+            function unlock() {
+                init();
+                if (ctx.state === 'suspended') ctx.resume();
+                return ctx;
+            }
+
+            function play(type, freq, opts) {
+                opts = opts || {};
+                init();
+                if (ctx.state === 'suspended') ctx.resume();
+
+                const builder = BUILD[type] || BUILD.piano;
+                let dur = DUR[type] || 1.8;
+                // hold：长按持续音色一直发声，直到 release() 才淡出
+                if (opts.hold && SUSTAIN[type]) dur = 12;
+
+                const t = ctx.currentTime + 0.02;   // 提前 20ms 排程，避开 JS 时钟抖动
+                const v = builder(freq, dur, opts.vel || 1, t);
+                v.t = t;
+                v.type = type;
+
+                // 每个音源都必须有明确的 stop()：靠 onended 做清理，不用 setTimeout
+                let left = v.srcs.length;
+                for (let i = 0; i < v.srcs.length; i++) {
+                    const s = v.srcs[i];
+                    s.onended = function () {
+                        if (--left <= 0) {
+                            try { v.out.disconnect(); } catch (e) {}
+                            if (v.revNode) { try { v.revNode.disconnect(); } catch (e) {} }
+                        }
+                    };
+                    try { s.start(t); } catch (e) {}
+                    try { s.stop(t + v.cap); } catch (e) {}
+                }
+                return v;
+            }
+
+            // 提前释放（长按音色抬键时调用）：从当前电平平滑淡出并停掉所有音源
+            function release(v, rel) {
+                if (!v || v.released) return;
+                v.released = true;
+                rel = rel == null ? 0.12 : rel;
+                const at = Math.max(ctx.currentTime, v.t + 0.03);
+                const g = v.out.gain;
+                try {
+                    if (g.cancelAndHoldAtTime) {
+                        g.cancelAndHoldAtTime(at);
+                    } else {
+                        const cur = g.value;
+                        g.cancelScheduledValues(at);
+                        g.setValueAtTime(cur, at);
+                    }
+                } catch (e) {
+                    try { g.cancelScheduledValues(at); } catch (e2) {}
+                }
+                try {
+                    g.exponentialRampToValueAtTime(EPS, at + rel);
+                    g.setValueAtTime(0, at + rel);
+                } catch (e) {}
+                for (let i = 0; i < v.srcs.length; i++) {
+                    try { v.srcs[i].stop(at + rel + 0.05); } catch (e) {}
+                }
+            }
+
+            return {
+                names: NAMES,
+                isSustain: function (type) { return !!SUSTAIN[type]; },
+                init: init,
+                unlock: unlock,
+                play: play,
+                release: release
+            };
+        })();
+
         document.addEventListener('DOMContentLoaded', () => {
-            let audioContext;
-            try {
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            } catch (e) {
+            if (!(window.AudioContext || window.webkitAudioContext)) {
                 alert('您的浏览器不支持Web Audio API，无法使用钢琴功能');
                 return;
             }
@@ -488,200 +1071,29 @@
             let currentSoundType = 'piano';
             
             // 存储当前活动的振荡器和增益节点
-            const activeOscillators = {};
+            const activeVoices = {};
             
-            // 更接近钢琴的音色实现
-            function playPianoTone(freq, key) {
-                const now = audioContext.currentTime;
-                const duration = 1.5;
-                
-                // 创建主振荡器（锯齿波，提供丰富的泛音）
-                const mainOsc = audioContext.createOscillator();
-                mainOsc.type = 'sawtooth';
-                mainOsc.frequency.value = freq;
-                
-                // 创建辅助振荡器（正弦波，增强基音）
-                const subOsc = audioContext.createOscillator();
-                subOsc.type = 'sine';
-                subOsc.frequency.value = freq;
-                
-                // 创建低频振荡器（颤音效果）
-                const lfo = audioContext.createOscillator();
-                lfo.type = 'sine';
-                lfo.frequency.value = 5; // 缓慢颤音
-                
-                // 创建增益控制器（颤音效果）
-                const lfoGain = audioContext.createGain();
-                lfoGain.gain.value = 0.8; // 颤音强度
-                
-                // 创建滤波器（塑造音色）
-                const filter = audioContext.createBiquadFilter();
-                filter.type = 'lowpass';
-                filter.frequency.value = 2000;
-                filter.Q.value = 1;
-                
-                // 创建主增益节点（音量包络）
-                const mainGain = audioContext.createGain();
-                mainGain.gain.setValueAtTime(0, now);
-                mainGain.gain.linearRampToValueAtTime(0.3, now + 0.02); // 快速起音
-                mainGain.gain.exponentialRampToValueAtTime(0.15, now + 0.1); // 衰减
-                mainGain.gain.exponentialRampToValueAtTime(0.01, now + duration); // 释放
-                
-                // 创建辅助增益节点
-                const subGain = audioContext.createGain();
-                subGain.gain.value = 0.2;
-                
-                // 连接节点
-                lfo.connect(lfoGain);
-                lfoGain.connect(mainOsc.detune);
-                
-                mainOsc.connect(filter);
-                subOsc.connect(subGain);
-                subGain.connect(filter);
-                filter.connect(mainGain);
-                mainGain.connect(audioContext.destination);
-                
-                // 启动振荡器
-                mainOsc.start(now);
-                subOsc.start(now);
-                lfo.start(now);
-                
-                // 停止振荡器
-                mainOsc.stop(now + duration);
-                subOsc.stop(now + duration);
-                lfo.stop(now + duration);
-                
-                // 存储振荡器以便释放
-                activeOscillators[key] = {
-                    oscillators: [mainOsc, subOsc, lfo],
-                    gain: mainGain
-                };
-            }
-            
-            // 正弦波音色
-            function playSineTone(freq, key) {
-                const oscillator = audioContext.createOscillator();
-                const gainNode = audioContext.createGain();
-                
-                oscillator.connect(gainNode);
-                gainNode.connect(audioContext.destination);
-                
-                oscillator.type = 'sine';
-                oscillator.frequency.value = freq;
-                gainNode.gain.value = 0.1;
-                
-                oscillator.start();
-                
-                // 存储振荡器以便释放
-                activeOscillators[key] = {
-                    oscillators: [oscillator],
-                    gain: gainNode
-                };
-            }
-            
-            // 风琴音色
-            function playOrganTone(freq, key) {
-                const now = audioContext.currentTime;
-                
-                // 创建三个振荡器（风琴音色）
-                const osc1 = audioContext.createOscillator();
-                const osc2 = audioContext.createOscillator();
-                const osc3 = audioContext.createOscillator();
-                
-                osc1.type = 'sine';
-                osc2.type = 'sine';
-                osc3.type = 'sine';
-                
-                // 风琴音色使用多个谐波
-                osc1.frequency.value = freq;
-                osc2.frequency.value = freq * 2;
-                osc3.frequency.value = freq * 3;
-                
-                // 创建增益节点
-                const gain1 = audioContext.createGain();
-                const gain2 = audioContext.createGain();
-                const gain3 = audioContext.createGain();
-                
-                gain1.gain.value = 0.3;
-                gain2.gain.value = 0.2;
-                gain3.gain.value = 0.15;
-                
-                // 主增益节点
-                const mainGain = audioContext.createGain();
-                mainGain.gain.value = 0.4;
-                
-                // 连接节点
-                osc1.connect(gain1);
-                osc2.connect(gain2);
-                osc3.connect(gain3);
-                
-                gain1.connect(mainGain);
-                gain2.connect(mainGain);
-                gain3.connect(mainGain);
-                
-                mainGain.connect(audioContext.destination);
-                
-                // 启动振荡器
-                osc1.start(now);
-                osc2.start(now);
-                osc3.start(now);
-                
-                // 存储振荡器以便释放
-                activeOscillators[key] = {
-                    oscillators: [osc1, osc2, osc3],
-                    gain: mainGain
-                };
-            }
-            
-            // 停止特定键的音符
-            function stopTone(key) {
-                if (activeOscillators[key]) {
-                    // 停止所有振荡器
-                    activeOscillators[key].oscillators.forEach(osc => {
-                        try {
-                            osc.stop();
-                        } catch(e) {
-                            console.warn("Error stopping oscillator:", e);
-                        }
-                    });
-                    
-                    // 快速淡出增益（避免爆音）
-                    const now = audioContext.currentTime;
-                    activeOscillators[key].gain.gain.setValueAtTime(
-                        activeOscillators[key].gain.gain.value, 
-                        now
-                    );
-                    activeOscillators[key].gain.gain.exponentialRampToValueAtTime(
-                        0.001, 
-                        now + 0.1
-                    );
-                    
-                    // 从活动振荡器中移除
-                    delete activeOscillators[key];
-                }
-            }
-            
-            // 根据当前音色类型播放音调
+            // 按当前音色播放一个音符。
+            // 可持续音色（正弦波/风琴/弦乐/长笛/8-bit）长按会一直发声，抬键时淡出；
+            // 打击类音色（钢琴/电钢琴/吉他/八音盒）无论按多久都只响一次并自然衰减。
             function playTone(freq, key) {
-                if (!audioContext) return;
-                
-                // 如果已经有相同键的音符在播放，先停止它
-                if (activeOscillators[key]) {
-                    stopTone(key);
+                // 同一个键重复触发时，先释放上一个音符
+                if (activeVoices[key]) {
+                    Synth.release(activeVoices[key]);
+                    delete activeVoices[key];
                 }
                 
-                switch(currentSoundType) {
-                    case 'piano':
-                        playPianoTone(freq, key);
-                        break;
-                    case 'sine':
-                        playSineTone(freq, key);
-                        break;
-                    case 'organ':
-                        playOrganTone(freq, key);
-                        break;
-                    default:
-                        playPianoTone(freq, key);
+                const voice = Synth.play(currentSoundType, freq, { hold: true });
+                if (Synth.isSustain(currentSoundType)) {
+                    activeVoices[key] = voice;
+                }
+            }
+            
+            // 停止特定键的音符（仅对可持续音色有效，打击类音色会自行衰减完）
+            function stopTone(key) {
+                if (activeVoices[key]) {
+                    Synth.release(activeVoices[key]);
+                    delete activeVoices[key];
                 }
             }
             
@@ -718,10 +1130,8 @@
                     }
                 });
                 
-                // 停止声音（如果是持续音色）
-                if (currentSoundType === 'sine' || currentSoundType === 'organ') {
-                    stopTone(key);
-                }
+                // 停止声音（打击类音色不在 activeVoices 里，stopTone 会自动跳过）
+                stopTone(key);
             }
             
             // 处理按键按下
@@ -760,9 +1170,7 @@
             
             // 主按键事件处理
             document.addEventListener('keydown', (e) => {
-                if (!audioContext) {
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                }
+                Synth.unlock();
                 
                 const isNumpad = e.location === KeyboardEvent.DOM_KEY_LOCATION_NUMPAD;
                 let key = e.key;
@@ -801,9 +1209,7 @@
             // 添加鼠标点击小键盘的交互
             numpadKeys.forEach(key => {
                 key.addEventListener('mousedown', () => {
-                    if (!audioContext) {
-                        audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                    }
+                    Synth.unlock();
                     
                     const keyValue = key.dataset.key;
                     handleKeyDown(keyValue);
@@ -833,11 +1239,10 @@
                     // 更新当前音色类型
                     currentSoundType = btn.dataset.type;
                     document.getElementById('soundType').textContent = 
-                        currentSoundType === 'piano' ? '钢琴' : 
-                        currentSoundType === 'sine' ? '正弦波' : '风琴';
+                        Synth.names[currentSoundType] || currentSoundType;
                     
                     // 切换音色时停止所有声音
-                    Object.keys(activeOscillators).forEach(key => {
+                    Object.keys(activeVoices).forEach(key => {
                         stopTone(key);
                     });
                 });
@@ -845,11 +1250,7 @@
             
             // 添加触摸设备支持
             document.body.addEventListener('touchstart', function() {
-                if (!audioContext) {
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                } else if (audioContext.state === 'suspended') {
-                    audioContext.resume();
-                }
+                Synth.unlock();
             }, false);
         });
     </script>
