@@ -455,7 +455,7 @@
                 <br>7: C5 (523.25Hz) | 8: D5 (587.33Hz) | 9: E5 (659.26Hz)
                 <br>+: F5 (698.46Hz) | /: G5 (783.99Hz) | *: A5 (880.00Hz) | -: B5 (987.77Hz)
             </p>
-            <p><strong>按键行为：</strong> 打击类音色（钢琴、电钢琴、吉他、八音盒）按一次响一次并自然衰减；持续类音色（弦乐、长笛、8-bit、风琴、正弦波）按住会一直发声，松手时淡出</p>
+            <p><strong>按键行为：</strong> 打击类音色（钢琴、电钢琴、吉他、八音盒）按一次响一次并自然衰减；持续类音色（弦乐、长笛、8-bit、风琴、正弦波）按住会一直发声。所有音色松开按键都会立即抑制音尾（模拟止音器），混响余响一并收住</p>
         </div>
     </div>
     
@@ -482,13 +482,20 @@
             };
             // 长按可持续的音色（松开时淡出），其余为一次性衰减音色
             const SUSTAIN = { sine: 1, organ: 1, strings: 1, flute: 1, chip: 1 };
+            // 抬键时的阻尼（止音）时间，单位秒。模拟钢琴止音器：松开按键后音尾要
+            // 迅速收住，而不是继续把自然衰减走完。持续类留长一点，避免切出咔哒声。
+            const DAMP = {
+                piano: 0.10, rhodes: 0.12, guitar: 0.09, musicbox: 0.13,
+                strings: 0.20, flute: 0.15, chip: 0.06, organ: 0.12, sine: 0.08
+            };
             // 各音色默认发声时长（秒）
             const DUR = {
                 piano: 1.5, sine: 1.6, organ: 1.4, rhodes: 1.8, guitar: 2.0,
                 musicbox: 2.2, strings: 2.0, flute: 1.8, chip: 1.6
             };
 
-            let ctx = null, master = null, revBus = null, noiseBuf = null;
+            let ctx = null, master = null, revBus = null, revGate = null, noiseBuf = null;
+            let held = 0;          // 还没被抬键抑制掉的发声单元个数
             let pulseCache = null;
             const ksCache = new Map();
             const BUILD = {};
@@ -603,6 +610,25 @@
                 g.gain.linearRampToValueAtTime(cents, t + delay + 0.15);
                 lfo.connect(g).connect(target);
                 return lfo;
+            }
+
+            // 混响总线的开合：还有音在响就开着，全松开就收掉
+            function reverbOpen(open) {
+                if (!revGate) return;
+                const now = ctx.currentTime;
+                const g = revGate.gain;
+                try {
+                    if (g.cancelAndHoldAtTime) {
+                        g.cancelAndHoldAtTime(now);
+                    } else {
+                        const cur = g.value;
+                        g.cancelScheduledValues(now);
+                        g.setValueAtTime(cur, now);
+                    }
+                } catch (e) {
+                    try { g.cancelScheduledValues(now); } catch (e2) {}
+                }
+                g.linearRampToValueAtTime(open ? 1 : 0, now + (open ? 0.04 : 0.12));
             }
 
             // 一个音符的公共输出节点；wet 为送入混响的湿声比例
@@ -955,8 +981,14 @@
                 revBus = ctx.createGain();
                 const conv = ctx.createConvolver();
                 conv.buffer = makeIR(2.6, 3.0);
+                // 闸门放在卷积器之后。卷积器是共用的，没法单路控制；但只要所有音都
+                // 松开了，就没有任何东西该在响，此时整条混响收掉才对，否则抬键之后
+                // 还会听到 2 秒多的余响尾巴。
+                revGate = ctx.createGain();
+                revGate.gain.value = 1;
                 revBus.connect(conv);
-                conv.connect(gain(0.55)).connect(master);
+                conv.connect(revGate);
+                revGate.connect(gain(0.55)).connect(master);
 
                 getNoise();
                 return ctx;
@@ -984,6 +1016,9 @@
                 v.t = t;
                 v.type = type;
 
+                held++;
+                reverbOpen(true);
+
                 // 每个音源都必须有明确的 stop()：靠 onended 做清理，不用 setTimeout
                 let left = v.srcs.length;
                 for (let i = 0; i < v.srcs.length; i++) {
@@ -1000,12 +1035,14 @@
                 return v;
             }
 
-            // 提前释放（长按音色抬键时调用）：从当前电平平滑淡出并停掉所有音源
+            // 抬键抑制（止音器）：从当前电平快速淡出并停掉所有音源。
+            // 打击类音色本来要自然衰减一两秒，松开按键后不该继续拖着尾巴。
             function release(v, rel) {
                 if (!v || v.released) return;
                 v.released = true;
-                rel = rel == null ? 0.12 : rel;
-                const at = Math.max(ctx.currentTime, v.t + 0.03);
+                if (rel == null) rel = DAMP[v.type] == null ? 0.12 : DAMP[v.type];
+                // 给最短发声时间，否则极短的点击会被砍得只剩咔哒
+                const at = Math.max(ctx.currentTime, v.t + 0.04);
                 const g = v.out.gain;
                 try {
                     if (g.cancelAndHoldAtTime) {
@@ -1025,11 +1062,16 @@
                 for (let i = 0; i < v.srcs.length; i++) {
                     try { v.srcs[i].stop(at + rel + 0.05); } catch (e) {}
                 }
+
+                held = Math.max(0, held - 1);
+                if (held === 0) reverbOpen(false);
             }
 
             return {
                 names: NAMES,
+                dampTimes: DAMP,
                 isSustain: function (type) { return !!SUSTAIN[type]; },
+                holding: function () { return held; },
                 init: init,
                 unlock: unlock,
                 play: play,
@@ -1083,10 +1125,8 @@
                     delete activeVoices[key];
                 }
                 
-                const voice = Synth.play(currentSoundType, freq, { hold: true });
-                if (Synth.isSustain(currentSoundType)) {
-                    activeVoices[key] = voice;
-                }
+                // 所有音色都要记账：抬键时不光是持续类，打击类也要抑制音尾
+                activeVoices[key] = Synth.play(currentSoundType, freq, { hold: true });
             }
             
             // 停止特定键的音符（仅对可持续音色有效，打击类音色会自行衰减完）
@@ -1246,6 +1286,12 @@
                         stopTone(key);
                     });
                 });
+            });
+            
+            // 切到别的窗口时把还按着的音都收掉。keyup 是收不到的，不收的话
+            // 持续音色会一直响下去，混响闸门也会一直开着。
+            window.addEventListener('blur', () => {
+                Object.keys(activeVoices).forEach(key => stopNote(key));
             });
             
             // 添加触摸设备支持
