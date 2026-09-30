@@ -482,8 +482,10 @@
             };
             // 长按可持续的音色（松开时淡出），其余为一次性衰减音色
             const SUSTAIN = { sine: 1, organ: 1, strings: 1, flute: 1, chip: 1 };
-            // 抬键时的阻尼（止音）时间，单位秒。模拟钢琴止音器：松开按键后音尾要
-            // 迅速收住，而不是继续把自然衰减走完。持续类留长一点，避免切出咔哒声。
+            // 释放淡出时间，单位秒。只用于**没有自然衰减**的持续类音色（弦乐/长笛/
+            // 8-bit/风琴/正弦波）：这类音按住时是持平发声，"衰减加速"无从谈起，
+            // 松手就是一次普通的释放淡出。
+            // 有自然衰减的音色（钢琴/电钢琴/吉他/八音盒）不用这张表，见 release()。
             const DAMP = {
                 piano: 0.10, rhodes: 0.12, guitar: 0.09, musicbox: 0.13,
                 strings: 0.20, flute: 0.15, chip: 0.06, organ: 0.12, sine: 0.08
@@ -612,8 +614,9 @@
                 return lfo;
             }
 
-            // 混响总线的开合：还有音在响就开着，全松开就收掉
-            function reverbOpen(open) {
+            // 混响总线的开合：还有音在响就开着，全松开就按音尾的节奏衰减掉。
+            // rel 传该次 release 的时长，让混响和音尾同步加速。
+            function reverbOpen(open, rel) {
                 if (!revGate) return;
                 const now = ctx.currentTime;
                 const g = revGate.gain;
@@ -628,21 +631,34 @@
                 } catch (e) {
                     try { g.cancelScheduledValues(now); } catch (e2) {}
                 }
-                g.linearRampToValueAtTime(open ? 1 : 0, now + (open ? 0.04 : 0.12));
+                if (open) {
+                    g.linearRampToValueAtTime(1, now + 0.04);
+                } else {
+                    // 跟着音尾一起加速衰减下去，而不是一刀切掉：闸门硬切会让整个房间
+                    // 的余响"啪"地消失。留 0.2s 下限，免得多次快速点击时糊在一起。
+                    const t = Math.max(rel == null ? 0.3 : rel, 0.2);
+                    g.exponentialRampToValueAtTime(EPS, now + t);
+                    g.setValueAtTime(0, now + t);
+                }
             }
 
-            // 一个音符的公共输出节点；wet 为送入混响的湿声比例
+            // 一个音符的公共输出节点；wet 为送入混响的湿声比例。
+            // 链路：乐器包络 -> out -> damper -> master / 混响送出
+            // damper 常态为 1，只在抬键时才动，用来给衰减"加速度"（见 release()）。
             function newVoice(wet) {
                 const out = ctx.createGain();
                 out.gain.value = 1;
-                out.connect(master);
+                const damper = ctx.createGain();
+                damper.gain.value = 1;
+                out.connect(damper);
+                damper.connect(master);
                 let revNode = null;
                 if (wet) {
                     revNode = gain(wet);
-                    out.connect(revNode);
+                    damper.connect(revNode);
                     revNode.connect(revBus);
                 }
-                return { out: out, revNode: revNode, srcs: [], cap: 1 };
+                return { out: out, damper: damper, revNode: revNode, srcs: [], cap: 1, decayDb: 0 };
             }
 
             /* ---------------- 各音色 ---------------- */
@@ -664,6 +680,8 @@
                 mainGain.gain.exponentialRampToValueAtTime(0.15, t + 0.1);
                 mainGain.gain.exponentialRampToValueAtTime(EPS, t + dur);
                 mainGain.gain.setValueAtTime(0, t + dur);
+                // 自然衰减速率（dB/s）：0.15 衰到 EPS 用了 (dur-0.1) 秒
+                v.decayDb = 20 * Math.log10(0.15 / EPS) / Math.max(dur - 0.1, 0.05);
                 const subGain = gain(0.2);
                 lfo.connect(lfoGain).connect(mainOsc.detune);
                 mainOsc.connect(filter);
@@ -683,6 +701,9 @@
                     [1.0, 2.2 * vel, 0.90, 0.34, 1.6, 0.10],
                     [14.0, 1.4 * vel, 0.10, 0.06, 0.55, 0.0]
                 ];
+                // 电钢琴有延长音，实测衰减很慢：音体层 1.6s 内从峰值衰到 10%
+                v.decayDb = 20 * Math.log10(1 / Math.max(layers[0][5], 1e-3)) / Math.max(layers[0][4], 0.01);
+
                 for (let i = 0; i < layers.length; i++) {
                     const L = layers[i];
                     const car = osc('sine', freq);
@@ -760,14 +781,32 @@
                     }
                 }
 
-                ksCache.set(key, buf);
-                return buf;
+                // 量一下这条波形的自然衰减速率（dB/s）。Karplus-Strong 的放能快慢
+                // 随音高变化，抬键加速得按每个音自己的速率算，不能用固定值。
+                const win = Math.max(1, Math.floor(sr * 0.02));
+                let refVal = 0, refIdx = 0;
+                for (let i = 0; i + win <= len; i += win) {
+                    let p = 0;
+                    for (let j = i; j < i + win; j++) { const a = Math.abs(data[j]); if (a > p) p = a; }
+                    if (p > refVal) { refVal = p; refIdx = i; }
+                }
+                let t20 = 0;
+                for (let i = refIdx + win; i + win <= len; i += win) {
+                    let p = 0;
+                    for (let j = i; j < i + win; j++) { const a = Math.abs(data[j]); if (a > p) p = a; }
+                    if (p <= refVal / 10) { t20 = i; break; }          // 峰值以下 20dB
+                }
+                const rec = { buf: buf, decayDb: t20 ? 20 / ((t20 - refIdx) / sr) : 20 / (len / sr) };
+                ksCache.set(key, rec);
+                return rec;
             }
 
             BUILD.guitar = function (freq, dur, vel, t) {
                 const v = newVoice(0.16);
                 const src = ctx.createBufferSource();
-                src.buffer = ksBuffer(freq, Math.min(dur + 0.6, 3.2), 0.9985, 0.58);
+                const ks = ksBuffer(freq, Math.min(dur + 0.6, 3.2), 0.9985, 0.58);
+                src.buffer = ks.buf;
+                v.decayDb = ks.decayDb;
                 const hp = ctx.createBiquadFilter();          // 去掉过低的闷响
                 hp.type = 'highpass';
                 hp.frequency.value = 75;
@@ -837,6 +876,8 @@
                 nb.connect(nhp).connect(ng).connect(hp);
                 v.srcs.push(nb);
 
+                // 基音在 2.2*scale 秒内从 LV 衰到 EPS
+                v.decayDb = 20 * Math.log10(LV / EPS) / Math.max(2.2 * scale, 0.05);
                 v.cap = end + 0.1;
                 return v;
             };
@@ -1035,36 +1076,44 @@
                 return v;
             }
 
-            // 抬键抑制（止音器）：从当前电平快速淡出并停掉所有音源。
-            // 打击类音色本来要自然衰减一两秒，松开按键后不该继续拖着尾巴。
-            function release(v, rel) {
+            // 抬键止音：不是把音尾掐掉，而是让衰减加速到约 3 倍再走完。
+            //
+            // damper 与乐器自身的衰减是相乘关系，速率相加：
+            //     松手后总速率 = k(乐器) + k_d(止音器)，要它等于 3k，则 k_d = 2k
+            //     => damper 从 1 衰到 EPS 用 80/(2k) = 40/k 秒（80dB 是 1 到 EPS 的跨度）
+            // k 由各音色自己登记在 decayDb 上（单位 dB/s），因为它们的自然衰减速率
+            // 相差很远：钢琴约 45 dB/s，电钢琴有延长音只有 12.5 dB/s。用固定系数
+            // 推不出统一的 3 倍，实测会跑成 6 倍（又变回接近急停）。
+            //
+            // 持续类音色没有自然衰减（k=0），"3 倍速"无从谈起，退回 DAMP 表的释放淡出。
+            function release(v, rel, when) {
                 if (!v || v.released) return;
                 v.released = true;
-                if (rel == null) rel = DAMP[v.type] == null ? 0.12 : DAMP[v.type];
-                // 给最短发声时间，否则极短的点击会被砍得只剩咔哒
-                const at = Math.max(ctx.currentTime, v.t + 0.04);
-                const g = v.out.gain;
-                try {
-                    if (g.cancelAndHoldAtTime) {
-                        g.cancelAndHoldAtTime(at);
-                    } else {
-                        const cur = g.value;
-                        g.cancelScheduledValues(at);
-                        g.setValueAtTime(cur, at);
-                    }
-                } catch (e) {
-                    try { g.cancelScheduledValues(at); } catch (e2) {}
+
+                // when 可把释放排到将来的某个时刻（测试、自动演奏、将来的踏板功能都用得上）
+                const at = Math.max(when == null ? ctx.currentTime : when, v.t + 0.04);
+                if (rel == null) {
+                    rel = v.decayDb > 0 ? 40 / v.decayDb : (DAMP[v.type] == null ? 0.12 : DAMP[v.type]);
                 }
+
+                const g = v.damper.gain;
                 try {
+                    g.cancelScheduledValues(at);
+                    g.setValueAtTime(1, at);       // damper 此前未被动过，恒为 1
                     g.exponentialRampToValueAtTime(EPS, at + rel);
                     g.setValueAtTime(0, at + rel);
                 } catch (e) {}
-                for (let i = 0; i < v.srcs.length; i++) {
-                    try { v.srcs[i].stop(at + rel + 0.05); } catch (e) {}
+
+                // 只提前停，不推迟：rel 现在可能比源本来要停的时刻更晚
+                const stopAt = at + rel + 0.05;
+                if (stopAt < v.t + v.cap) {
+                    for (let i = 0; i < v.srcs.length; i++) {
+                        try { v.srcs[i].stop(stopAt); } catch (e) {}
+                    }
                 }
 
                 held = Math.max(0, held - 1);
-                if (held === 0) reverbOpen(false);
+                if (held === 0) reverbOpen(false, rel);
             }
 
             return {
