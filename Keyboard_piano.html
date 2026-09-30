@@ -600,7 +600,7 @@
             };
             // 各音色默认发声时长（秒）
             const DUR = {
-                piano: 1.5, sine: 1.6, organ: 1.4, rhodes: 1.8, guitar: 2.0,
+                piano: 3.2, sine: 1.6, organ: 1.4, rhodes: 1.8, guitar: 2.0,
                 musicbox: 2.2, strings: 2.0, flute: 1.8, chip: 1.6
             };
 
@@ -785,11 +785,14 @@
                 const mainGain = ctx.createGain();
                 mainGain.gain.setValueAtTime(0, t);
                 mainGain.gain.linearRampToValueAtTime(0.3, t + 0.02);
-                mainGain.gain.exponentialRampToValueAtTime(0.15, t + 0.1);
+                // 真实钢琴是两段衰减：击弦后先快掉一段（泛音先跑掉），再拖一条长尾。
+                // 原来是一条指数从 0.15 直落 EPS（1.4s，约 -45dB/s），按住不放 1 秒
+                // 就掉到 -47dB 了 —— 松手时根本没剩下可听的东西，再加速 3 倍自然是"没声"。
+                mainGain.gain.exponentialRampToValueAtTime(0.075, t + 0.5);
                 mainGain.gain.exponentialRampToValueAtTime(EPS, t + dur);
                 mainGain.gain.setValueAtTime(0, t + dur);
-                // 自然衰减速率（dB/s）：0.15 衰到 EPS 用了 (dur-0.1) 秒
-                v.decayDb = 20 * Math.log10(0.15 / EPS) / Math.max(dur - 0.1, 0.05);
+                // 登记长尾段的速率（约 -21dB/s），抬键加速按这个算
+                v.decayDb = 20 * Math.log10(0.075 / EPS) / Math.max(dur - 0.5, 0.05);
                 const subGain = gain(0.2);
                 lfo.connect(lfoGain).connect(mainOsc.detune);
                 mainOsc.connect(filter);
@@ -1201,7 +1204,12 @@
                 // when 可把释放排到将来的某个时刻（测试、自动演奏、将来的踏板功能都用得上）
                 const at = Math.max(when == null ? ctx.currentTime : when, v.t + 0.04);
                 if (rel == null) {
-                    rel = v.decayDb > 0 ? 40 / v.decayDb : (DAMP[v.type] == null ? 0.12 : DAMP[v.type]);
+                    // 40/decayDb 秒正是"总速率 = 3k"所需的 damper 时长。
+                    // 下限 0.3s 是保险：若某个音色衰减极快，3 倍后只剩不到 0.3 秒，
+                    // 那听起来就是一声咔哒而不是"加速的尾音"，此时宁可比 3 倍再慢一点。
+                    rel = v.decayDb > 0
+                        ? Math.max(40 / v.decayDb, 0.3)
+                        : (DAMP[v.type] == null ? 0.12 : DAMP[v.type]);
                 }
 
                 const g = v.damper.gain;
